@@ -219,13 +219,12 @@ legacy_handle_post(legacy_mirror_t *legacy, int fd, const char *body,
 {
     legacy_log_plist(legacy, body, body_len);
 
-    static const char response[] =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Length: 0\r\n"
-        "Server: AirTunes/130.14\r\n\r\n";
-    if (legacy_send_all(fd, response, sizeof(response) - 1) < 0) {
-        return -1;
-    }
+    /* Per the AirPlay mirroring spec and both reference implementations
+     * (espes/Slave-in-the-Magic-Mirror, tzwenn/PyOpenAirMirror), POST /stream
+     * does NOT get an HTTP response.  The client sends a binary plist and
+     * then immediately starts sending 128-byte-header video packets on the
+     * same TCP connection.  Sending a 200 OK here pollutes the client's
+     * read path and prevents it from starting the video stream. */
 
     logger_log(legacy->logger, LOGGER_INFO,
                "Accepted iOS 6 POST /stream; handing off legacy H.264 stream");
