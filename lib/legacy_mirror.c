@@ -183,6 +183,12 @@ legacy_read_request(int fd, char **request,
 static void
 legacy_handle_get(legacy_mirror_t *legacy, int fd)
 {
+    /* Match the spec example: 1280x720, 60Hz, overscanned.
+     * Some iOS 5/6 clients may reject non-overscanned or high-res modes. */
+    uint16_t width = 1280;
+    uint16_t height = 720;
+    uint8_t overscanned = 1;
+
     char xml[768];
     int xml_len = snprintf(
         xml, sizeof(xml),
@@ -196,8 +202,8 @@ legacy_handle_get(legacy_mirror_t *legacy, int fd)
         "<key>version</key><string>130.14</string>"
         "<key>width</key><integer>%u</integer>"
         "</dict></plist>\r\n",
-        legacy->height, legacy->overscanned ? "true" : "false",
-        1.0 / (double) legacy->refresh_rate, legacy->width);
+        height, overscanned ? "true" : "false",
+        1.0 / (double) legacy->refresh_rate, width);
 
     char response[1024];
     int response_len = snprintf(
@@ -219,12 +225,13 @@ legacy_handle_post(legacy_mirror_t *legacy, int fd, const char *body,
 {
     legacy_log_plist(legacy, body, body_len);
 
-    /* Do NOT send a 200 OK response.  The spec says: "The client sends a
-     * binary property list with information about the stream, immediately
-     * followed by the stream itself. At this point, the connection is no
-     * longer a valid HTTP connection."  Both reference implementations
-     * (espes, PyOpenAirMirror) read the plist and immediately start reading
-     * raw video packets without sending any HTTP response. */
+    /* The spec says no HTTP response is sent for POST /stream, but iOS 8
+     * (AirPlay/160.10) appears to require one to keep the connection open.
+     * Send a minimal 200 OK with no body. */
+    static const char response[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 0\r\n\r\n";
+    legacy_send_all(fd, response, sizeof(response) - 1);
 
     logger_log(legacy->logger, LOGGER_INFO,
                "Accepted iOS 6 POST /stream; handing off legacy H.264 stream");
