@@ -225,13 +225,11 @@ legacy_handle_post(legacy_mirror_t *legacy, int fd, const char *body,
 {
     legacy_log_plist(legacy, body, body_len);
 
-    static const char response[] =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Length: 0\r\n"
-        "Server: AirTunes/130.14\r\n\r\n";
-    if (legacy_send_all(fd, response, sizeof(response) - 1) < 0) {
-        return -1;
-    }
+    /* Per the spec: "The client sends a binary property list with
+     * information about the stream, immediately followed by the stream
+     * itself. At this point, the connection is no longer a valid HTTP
+     * connection."  No HTTP response is sent.  The video thread starts
+     * reading raw 128-byte packets from the socket immediately. */
 
     logger_log(legacy->logger, LOGGER_INFO,
                "Accepted iOS 6 POST /stream; handing off legacy H.264 stream");
