@@ -219,11 +219,13 @@ legacy_handle_post(legacy_mirror_t *legacy, int fd, const char *body,
 {
     legacy_log_plist(legacy, body, body_len);
 
-    /* Per the AirPlay mirroring spec and reference implementations
-     * (espes/Slave-in-the-Magic-Mirror, tzwenn/PyOpenAirMirror), POST /stream
-     * does NOT get an HTTP response.  The client sends a binary plist and
-     * then immediately starts sending 128-byte-header video packets on the
-     * same TCP connection. */
+    static const char response[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 0\r\n"
+        "Server: AirTunes/130.14\r\n\r\n";
+    if (legacy_send_all(fd, response, sizeof(response) - 1) < 0) {
+        return -1;
+    }
 
     logger_log(legacy->logger, LOGGER_INFO,
                "Accepted iOS 6 POST /stream; handing off legacy H.264 stream");
@@ -266,9 +268,10 @@ legacy_handle_fairplay(legacy_mirror_t *legacy, int fd, const char *body,
         "Content-Length: %d\r\n"
         "Server: AirTunes/130.14\r\n\r\n",
         reply_len);
-    if (!legacy_send_all(fd, headers, (size_t) headers_len)) {
-        legacy_send_all(fd, (const char *) reply, (size_t) reply_len);
+    if (legacy_send_all(fd, headers, (size_t) headers_len) < 0) {
+        return;
     }
+    legacy_send_all(fd, (const char *) reply, (size_t) reply_len);
     logger_log(legacy->logger, LOGGER_INFO,
                "Handled iOS 6 FairPlay stage on TCP 7100 (%zu bytes)",
                body_len);
