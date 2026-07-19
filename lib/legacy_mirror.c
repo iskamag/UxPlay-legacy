@@ -216,7 +216,7 @@ legacy_handle_get(legacy_mirror_t *legacy, int fd)
     legacy_send_all(fd, response, (size_t) response_len);
     logger_log(legacy->logger, LOGGER_INFO,
                "Answered iOS 6 GET /stream.xml with %ux%u@%u",
-               legacy->width, legacy->height, legacy->refresh_rate);
+               width, height, legacy->refresh_rate);
 }
 
 static int
