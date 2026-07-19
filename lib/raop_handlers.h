@@ -675,6 +675,7 @@ raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
                           http_response_t *response)
 {
     raop_t *raop = conn->raop;
+    const char *url = http_request_get_url(request);
     const char *transport = http_request_get_header(request, "Transport");
     unsigned short remote_cport = 0;
     unsigned short remote_tport = 7010;
@@ -687,11 +688,11 @@ raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
     logger_log(raop->logger, LOGGER_INFO,
                "iOS 6 SETUP Transport: %s", transport);
 
-    /* iOS 5/6 sends two SETUPs on the RTSP connection: the first with
-     * mode=screen (establishes timing for the mirror session; video itself
-     * arrives later via POST /stream on TCP 7100) and the second with
-     * mode=record (audio).  Starting the audio receiver on mode=screen
-     * corrupts the session state and causes the client to tear down. */
+    /* iOS 5/6 sends two SETUPs: SETUP /audio (mode=screen, establishes
+     * timing + audio ports) and SETUP /video (mode=record, RTP/AVP/TCP).
+     * The video stream itself arrives via POST /stream on TCP 7100, not
+     * through the ports negotiated here. */
+    bool video_setup = (url && strstr(url, "/video"));
     bool screen_mode = false;
     const char *mode_val = strstr(transport, "mode=");
     if (mode_val) {
@@ -701,13 +702,12 @@ raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
         }
     }
 
-    /* mode=screen carries only NTP timing traffic, so echo whatever
-     * transport profile the client offered (typically RTP/AVP/UDP).
-     * mode=record carries audio, and the server's audio receiver is
-     * UDP-only, so the response must always say RTP/AVP/UDP regardless
-     * of what the client hinted (e.g. "RTP/AVP/TCP"). */
+    /* Echo the transport profile the client offered.  For /video the
+     * client asks for RTP/AVP/TCP (video comes over TCP via /stream),
+     * and we must acknowledge TCP, not force UDP.  For /audio the
+     * server's receiver is UDP-only, so always respond with RTP/AVP/UDP. */
     char transport_spec[32] = "RTP/AVP/UDP";
-    if (screen_mode) {
+    if (video_setup || screen_mode) {
         const char *spec_end = strchr(transport, ';');
         size_t spec_len = spec_end ? (size_t) (spec_end - transport)
                                    : strlen(transport);
@@ -727,7 +727,7 @@ raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
         http_response_init(response, "RTSP/1.0", 400, "Bad Request");
         return;
     }
-    if (!screen_mode && !conn->legacy_audio_announced) {
+    if (!screen_mode && !video_setup && !conn->legacy_audio_announced) {
         logger_log(raop->logger, LOGGER_ERR,
                    "iOS 6 SETUP mode=record arrived before ANNOUNCE");
         http_response_init(response, "RTSP/1.0", 455,
@@ -740,41 +740,40 @@ raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
         return;
     }
 
-    /* iOS 5/6 sends SETUP mode=screen first (to establish timing), then
-     * SETUP mode=record (for audio).  The client expects the server to
-     * allocate and return real audio port numbers in BOTH responses —
-     * responding with server_port=0 causes the client to skip the
-     * mode=record step and go straight to POST /stream, where it then
-     * waits indefinitely for a signal that never comes.
-     *
-     * Start the audio receiver on the first SETUP (whichever mode) so
-     * the port numbers are real, and reuse it on the second.  The mode
-     * in the response echoes the request's mode. */
-    unsigned short control_lport = raop->control_lport;
-    unsigned short data_lport = raop->data_lport;
-    if (!conn->raop_rtp) {
-        char remote[40] = {0};
-        utils_ipaddress_to_string(conn->remotelen, conn->remote,
-                                  conn->zone_id, remote,
-                                  (int) sizeof(remote));
-        conn->raop_rtp = raop_rtp_init(
-            raop->logger, &raop->callbacks, raop->legacy_ntp, remote,
-            conn->remotelen, conn->legacy_aeskey, conn->legacy_aesiv);
+    /* For /audio SETUP: start the audio receiver and return real audio
+     * port numbers.  For /video SETUP: the video stream comes over TCP
+     * via POST /stream, so don't allocate audio ports — just return the
+     * timing port and echo the TCP transport. */
+    unsigned short control_lport = 0;
+    unsigned short data_lport = 0;
+
+    if (!video_setup) {
+        control_lport = raop->control_lport;
+        data_lport = raop->data_lport;
         if (!conn->raop_rtp) {
-            http_response_init(response, "RTSP/1.0", 500,
-                               "Internal Server Error");
-            return;
+            char remote[40] = {0};
+            utils_ipaddress_to_string(conn->remotelen, conn->remote,
+                                      conn->zone_id, remote,
+                                      (int) sizeof(remote));
+            conn->raop_rtp = raop_rtp_init(
+                raop->logger, &raop->callbacks, raop->legacy_ntp, remote,
+                conn->remotelen, conn->legacy_aeskey, conn->legacy_aesiv);
+            if (!conn->raop_rtp) {
+                http_response_init(response, "RTSP/1.0", 500,
+                                   "Internal Server Error");
+                return;
+            }
+            unsigned char ct = conn->legacy_audio_ct;
+            unsigned int sample_rate = conn->legacy_audio_sample_rate;
+            raop_rtp_start_audio(conn->raop_rtp, &remote_cport,
+                                 &control_lport, &data_lport, &ct,
+                                 &sample_rate);
+            raop->control_lport = control_lport;
+            raop->data_lport = data_lport;
+        } else {
+            logger_log(raop->logger, LOGGER_INFO,
+                       "Reusing iOS 6 audio receiver for repeated SETUP");
         }
-        unsigned char ct = conn->legacy_audio_ct;
-        unsigned int sample_rate = conn->legacy_audio_sample_rate;
-        raop_rtp_start_audio(conn->raop_rtp, &remote_cport,
-                             &control_lport, &data_lport, &ct,
-                             &sample_rate);
-        raop->control_lport = control_lport;
-        raop->data_lport = data_lport;
-    } else {
-        logger_log(raop->logger, LOGGER_INFO,
-                   "Reusing iOS 6 audio receiver for repeated SETUP");
     }
 
     char response_transport[256];
@@ -786,11 +785,17 @@ raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
              raop_ntp_get_port(raop->legacy_ntp));
     http_response_add_header(response, "Transport", response_transport);
     http_response_add_header(response, "Session", "1");
-    logger_log(raop->logger, LOGGER_INFO,
-               "iOS 6 %s SETUP: audio UDP %u/%u, timing UDP %u",
-               screen_mode ? "screen" : "record",
-               data_lport, control_lport,
-               raop_ntp_get_port(raop->legacy_ntp));
+    if (video_setup) {
+        logger_log(raop->logger, LOGGER_INFO,
+                   "iOS 6 video SETUP: transport %s, timing UDP %u",
+                   transport_spec, raop_ntp_get_port(raop->legacy_ntp));
+    } else {
+        logger_log(raop->logger, LOGGER_INFO,
+                   "iOS 6 %s SETUP: audio UDP %u/%u, timing UDP %u",
+                   screen_mode ? "screen" : "record",
+                   data_lport, control_lport,
+                   raop_ntp_get_port(raop->legacy_ntp));
+    }
 }
 
 static void
