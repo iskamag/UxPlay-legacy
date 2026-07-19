@@ -746,9 +746,10 @@ raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
     char response_transport[256];
     snprintf(response_transport, sizeof(response_transport),
              "RTP/AVP/UDP;unicast;mode=record;server_port=%u;"
-             "control_port=%u;timing_port=%u",
+             "control_port=%u;timing_port=%u;event_port=%u",
              data_lport, control_lport,
-             raop_ntp_get_port(raop->legacy_ntp));
+             raop_ntp_get_port(raop->legacy_ntp),
+             raop->port);
     http_response_add_header(response, "Transport", response_transport);
     http_response_add_header(response, "Session", "1");
     logger_log(raop->logger, LOGGER_INFO,
