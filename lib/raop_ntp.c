@@ -269,69 +269,6 @@ raop_ntp_flush_socket(int fd)
     }
 }
 
-/*
- * iOS 5/6 mirroring requires the AirPlay server to act as an NTP server on
- * the timing_port advertised in the SETUP response.  The iOS device sends
- * standard NTPv4 client requests (mode=3) to our port 7011 and expects
- * server responses (mode=4) so it can synchronise its clock to ours.
- *
- * Without these responses, the client never achieves clock sync and refuses
- * to begin the H.264 video stream.  This function drains any pending
- * incoming requests and replies to each one, replacing the old
- * raop_ntp_flush_socket call that silently discarded them.
- */
-static void
-raop_ntp_respond_to_pending(raop_ntp_t *raop_ntp)
-{
-    while (1) {
-#ifdef _WIN32
-        u_long bytes_available = 0;
-#else
-        int bytes_available = 0;
-#endif
-        if (IOCTLSOCKET(raop_ntp->tsock, FIONREAD, &bytes_available) != 0 ||
-            bytes_available <= 0) {
-            break;
-        }
-
-        unsigned char req[48];
-        struct sockaddr_storage from_addr;
-        socklen_t from_len = sizeof(from_addr);
-        int len = recvfrom(raop_ntp->tsock, (char *)req, sizeof(req), 0,
-                           (struct sockaddr *)&from_addr, &from_len);
-        if (len <= 0) {
-            break;
-        }
-
-        /* Only respond to NTPv4 client requests (mode=3).  Delayed server
-         * responses to our own outgoing requests are silently discarded. */
-        if (len >= 48 && (req[0] & 0x07) == 3) {
-            unsigned char resp[48] = {0};
-            resp[0] = 0x24;   /* LI=0, VN=4, Mode=4 (server) */
-            resp[1] = 1;      /* stratum 1 */
-            resp[2] = 6;      /* poll = log2(64s) */
-            resp[3] = 0xfa;   /* precision */
-
-            uint64_t now = raop_ntp_get_local_time();
-
-            /* Reference timestamp */
-            byteutils_put_ntp_timestamp(resp, 16, now);
-            /* Originate timestamp = client's transmit timestamp (offset 40) */
-            memcpy(resp + 24, req + 40, 8);
-            /* Receive timestamp (when we processed this request) */
-            byteutils_put_ntp_timestamp(resp, 32, now);
-            /* Transmit timestamp (when we send this response) */
-            byteutils_put_ntp_timestamp(resp, 40, now);
-
-            sendto(raop_ntp->tsock, (char *)resp, sizeof(resp), 0,
-                   (struct sockaddr *)&from_addr, from_len);
-
-            logger_log(raop_ntp->logger, LOGGER_DEBUG,
-                       "raop_ntp responded to client NTP request");
-        }
-    }
-}
-
 static THREAD_RETVAL
 raop_ntp_thread(void *arg)
 {
@@ -363,13 +300,8 @@ raop_ntp_thread(void *arg)
         }
         MUTEX_UNLOCK(raop_ntp->run_mutex);
 
-        // For legacy NTP, respond to any client NTP requests that have
-        // accumulated since the last cycle.  For modern NTP, just flush.
-        if (raop_ntp->time_protocol == NTP_LEGACY) {
-            raop_ntp_respond_to_pending(raop_ntp);
-        } else {
-            raop_ntp_flush_socket(raop_ntp->tsock);
-        }
+        // Flush the socket in case a super delayed response arrived or something
+        raop_ntp_flush_socket(raop_ntp->tsock);
 
         // Send request
         uint64_t send_time = raop_ntp_get_local_time();
@@ -393,44 +325,13 @@ raop_ntp_thread(void *arg)
             logger_log(raop_ntp->logger, LOGGER_ERR, "raop_ntp error sending request. Error %d:%s",
                      sock_err, SOCKET_ERROR_STRING(sock_err));
         } else {
-            // Read response, filtering out any interleaved client NTP requests
-            bool legacy_ntp = raop_ntp->time_protocol == NTP_LEGACY;
-            while (1) {
-                response_len = recvfrom(raop_ntp->tsock, (char *)response, sizeof(response), 0, NULL, NULL);
-                if (response_len < 0) {
-                    /* timeout or error — no response arrived */
-                    break;
-                }
-                if (legacy_ntp && response_len >= 48 &&
-                    (response[0] & 0x07) == 3) {
-                    /* This is an incoming client request, not our response.
-                     * Reply immediately and keep waiting for the real
-                     * response. */
-                    unsigned char resp[48] = {0};
-                    resp[0] = 0x24;
-                    resp[1] = 1;
-                    resp[2] = 6;
-                    resp[3] = 0xfa;
-                    uint64_t now = raop_ntp_get_local_time();
-                    byteutils_put_ntp_timestamp(resp, 16, now);
-                    memcpy(resp + 24, response + 40, 8);
-                    byteutils_put_ntp_timestamp(resp, 32, now);
-                    byteutils_put_ntp_timestamp(resp, 40, now);
-                    /* Send back to the client's NTP port. */
-                    sendto(raop_ntp->tsock, (char *)resp, sizeof(resp), 0,
-                           (struct sockaddr *)&raop_ntp->remote_saddr,
-                           raop_ntp->remote_saddr_len);
-                    logger_log(raop_ntp->logger, LOGGER_DEBUG,
-                               "raop_ntp responded to interleaved client NTP request");
-                    continue;
-                }
-                break;
-            }
+            // Read response
+            response_len = recvfrom(raop_ntp->tsock, (char *)response, sizeof(response), 0, NULL, NULL);
             if (response_len < 0) {
                 char time[30];
                 ntp_timestamp_to_time(send_time, time, sizeof(time));
                 logger_log(raop_ntp->logger, LOGGER_DEBUG , "raop_ntp receive timeout (request sent %s)", time);
-            } else {
+	    } else {
                 recv_time = raop_ntp_get_local_time();
                 bool legacy_ntp = raop_ntp->time_protocol == NTP_LEGACY;
                 if ((legacy_ntp && response_len < 48) ||
@@ -510,14 +411,11 @@ raop_ntp_thread(void *arg)
         }
 
 wait_for_next_request:
-        /* Sleep before next cycle.  For legacy NTP we use a shorter
-         * interval so that client NTP requests waiting in the socket
-         * buffer get prompt responses at the start of the next cycle. */
+        // Sleep for 3 seconds
         struct timespec wait_time;
-        unsigned int wait_secs = (raop_ntp->time_protocol == NTP_LEGACY) ? 1 : 3;
         MUTEX_LOCK(raop_ntp->wait_mutex);
         clock_gettime(CLOCK_REALTIME, &wait_time);
-        wait_time.tv_sec += wait_secs;
+        wait_time.tv_sec += 3;
         pthread_cond_timedwait(&raop_ntp->wait_cond, &raop_ntp->wait_mutex, &wait_time);
         MUTEX_UNLOCK(raop_ntp->wait_mutex);
     }
