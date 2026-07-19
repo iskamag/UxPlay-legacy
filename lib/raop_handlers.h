@@ -586,7 +586,145 @@ raop_handler_options(raop_conn_t *conn,
                      http_request_t *request, http_response_t *response,
                      char **response_data, int *response_datalen)
 {
-    http_response_add_header(response, "Public", "SETUP, RECORD, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER");
+    http_response_add_header(response, "Public", "ANNOUNCE, SETUP, RECORD, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER");
+}
+
+static void
+raop_handler_announce(raop_conn_t *conn,
+                      http_request_t *request, http_response_t *response,
+                      char **response_data, int *response_datalen)
+{
+    raop_t *raop = conn->raop;
+    int data_len = 0;
+    const char *data = http_request_get_data(request, &data_len);
+    sdp_t *sdp = sdp_init(data, data_len);
+    if (!sdp) {
+        http_response_init(response, "RTSP/1.0", 400, "Bad Request");
+        return;
+    }
+
+    const char *fpaeskey = sdp_get_fpaeskey(sdp);
+    const char *aesiv = sdp_get_aesiv(sdp);
+    const char *rtpmap = sdp_get_rtpmap(sdp);
+    const char *fmtp = sdp_get_fmtp(sdp);
+    unsigned char encrypted_key[72] = {0};
+    int encrypted_key_len = base64_decode(fpaeskey, encrypted_key,
+                                          sizeof(encrypted_key));
+    int aesiv_len = base64_decode(aesiv, conn->legacy_aesiv,
+                                  sizeof(conn->legacy_aesiv));
+    if (encrypted_key_len != 72 || aesiv_len != 16 ||
+        fairplay_decrypt(conn->fairplay, encrypted_key,
+                         conn->legacy_aeskey)) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "Could not decode iOS 6 ANNOUNCE encryption keys");
+        http_response_init(response, "RTSP/1.0", 400, "Bad Request");
+        sdp_destroy(sdp);
+        return;
+    }
+
+    conn->legacy_audio_ct =
+        (fmtp && (strstr(fmtp, "AAC-eld") || strstr(fmtp, "AAC-ELD") ||
+                  strstr(fmtp, "aac-eld"))) ? 8 : 4;
+    if (rtpmap) {
+        const char *slash = strchr(rtpmap, '/');
+        if (slash) {
+            unsigned long sample_rate = strtoul(slash + 1, NULL, 10);
+            if (sample_rate >= 8000 && sample_rate <= 192000) {
+                conn->legacy_audio_sample_rate = (unsigned int) sample_rate;
+            }
+        }
+    }
+    conn->legacy_audio_announced = true;
+    logger_log(raop->logger, LOGGER_INFO,
+               "Accepted iOS 6 ANNOUNCE (%s, ct=%u, %u Hz)",
+               fmtp ? fmtp : "no fmtp", conn->legacy_audio_ct,
+               conn->legacy_audio_sample_rate);
+    sdp_destroy(sdp);
+}
+
+static int
+raop_legacy_transport_port(const char *transport, const char *name,
+                           unsigned short *port)
+{
+    const char *field = strstr(transport, name);
+    if (!field) {
+        return -1;
+    }
+    field += strlen(name);
+    unsigned long value = strtoul(field, NULL, 10);
+    if (!value || value > 65535) {
+        return -1;
+    }
+    *port = (unsigned short) value;
+    return 0;
+}
+
+static void
+raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
+                          http_response_t *response)
+{
+    raop_t *raop = conn->raop;
+    const char *transport = http_request_get_header(request, "Transport");
+    unsigned short remote_cport = 0;
+    unsigned short remote_tport = 7010;
+    if (!transport ||
+        raop_legacy_transport_port(transport, "control_port=",
+                                   &remote_cport)) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "Invalid iOS 6 SETUP Transport header");
+        http_response_init(response, "RTSP/1.0", 400, "Bad Request");
+        return;
+    }
+    raop_legacy_transport_port(transport, "timing_port=", &remote_tport);
+    if (!conn->legacy_audio_announced) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "iOS 6 SETUP arrived before ANNOUNCE");
+        http_response_init(response, "RTSP/1.0", 455,
+                           "Method Not Valid in This State");
+        return;
+    }
+    if (raop_ensure_legacy_ntp(conn, remote_tport)) {
+        http_response_init(response, "RTSP/1.0", 500,
+                           "Internal Server Error");
+        return;
+    }
+
+    if (conn->raop_rtp) {
+        raop_rtp_destroy(conn->raop_rtp);
+    }
+    char remote[40] = {0};
+    utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id,
+                              remote, (int) sizeof(remote));
+    conn->raop_rtp = raop_rtp_init(
+        raop->logger, &raop->callbacks, conn->raop_ntp, remote,
+        conn->remotelen, conn->legacy_aeskey, conn->legacy_aesiv);
+    if (!conn->raop_rtp) {
+        http_response_init(response, "RTSP/1.0", 500,
+                           "Internal Server Error");
+        return;
+    }
+
+    unsigned short control_lport = raop->control_lport;
+    unsigned short data_lport = raop->data_lport;
+    unsigned char ct = conn->legacy_audio_ct;
+    unsigned int sample_rate = conn->legacy_audio_sample_rate;
+    raop_rtp_start_audio(conn->raop_rtp, &remote_cport, &control_lport,
+                         &data_lport, &ct, &sample_rate);
+    raop->control_lport = control_lport;
+    raop->data_lport = data_lport;
+
+    char response_transport[256];
+    snprintf(response_transport, sizeof(response_transport),
+             "RTP/AVP/UDP;unicast;mode=record;server_port=%u;"
+             "control_port=%u;timing_port=%u",
+             data_lport, control_lport,
+             raop_ntp_get_port(conn->raop_ntp));
+    http_response_add_header(response, "Transport", response_transport);
+    http_response_add_header(response, "Session", "1");
+    logger_log(raop->logger, LOGGER_INFO,
+               "iOS 6 audio listening on UDP %u/%u; timing UDP %u",
+               data_lport, control_lport,
+               raop_ntp_get_port(conn->raop_ntp));
 }
 
 static void
@@ -602,6 +740,11 @@ raop_handler_setup(raop_conn_t *conn,
     const char *data = NULL;
     int data_len = 0;
     data = http_request_get_data(request, &data_len);
+
+    if (data_len == 0 && http_request_get_header(request, "Transport")) {
+        raop_handler_legacy_setup(conn, request, response);
+        return;
+    }
 
     dacp_id = http_request_get_header(request, "DACP-ID");
     active_remote_header = http_request_get_header(request, "Active-Remote");
@@ -1245,6 +1388,18 @@ raop_handler_teardown(raop_conn_t *conn,
     int data_len = 0;
     bool teardown_96 = false, teardown_110 = false;
     data = http_request_get_data(request, &data_len);
+    if (data_len == 0 && conn->legacy_audio_announced) {
+        http_response_add_header(response, "Connection", "close");
+        if (conn->raop_rtp) {
+            raop_rtp_destroy(conn->raop_rtp);
+            conn->raop_rtp = NULL;
+        }
+        if (conn->raop_rtp_mirror) {
+            raop_rtp_mirror_destroy(conn->raop_rtp_mirror);
+            conn->raop_rtp_mirror = NULL;
+        }
+        return;
+    }
     plist_t req_root_node = NULL;
     plist_from_bin(data, data_len, &req_root_node);
     plist_t req_streams_node = plist_dict_get_item(req_root_node, "streams");

@@ -134,6 +134,8 @@ RAOP_API void raop_set_tcp_ports(raop_t *raop, unsigned short port[2]);
 RAOP_API unsigned short raop_get_port(raop_t *raop);
 RAOP_API void *raop_get_callback_cls(raop_t *raop);
 RAOP_API int raop_start_httpd(raop_t *raop, unsigned short *port);
+RAOP_API int raop_start_legacy_mirror(raop_t *raop, unsigned short *port);
+RAOP_API void raop_stop_legacy_mirror(raop_t *raop);
 RAOP_API int raop_is_running(raop_t *raop);
 RAOP_API void raop_stop_httpd(raop_t *raop);
 RAOP_API void raop_set_dnssd(raop_t *raop, dnssd_t *dnssd);

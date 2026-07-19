@@ -276,9 +276,17 @@ raop_ntp_thread(void *arg)
     assert(raop_ntp);
     unsigned char response[128] = {0};
     int response_len = 0;
-    unsigned char request[32] = {0x80, 0xd2, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-    };
+    unsigned char request[48] = {0};
+    int request_len = 32;
+    if (raop_ntp->time_protocol == NTP_LEGACY) {
+        /* iOS 5/6 mirroring exposes a conventional NTPv4 server on 7010. */
+        request[0] = 0x23;
+        request_len = 48;
+    } else {
+        request[0] = 0x80;
+        request[1] = 0xd2;
+        request[3] = 0x07;
+    }
     raop_ntp_data_t data_sorted[RAOP_NTP_DATA_COUNT];
     const unsigned  two_pow_n[RAOP_NTP_DATA_COUNT] = {2, 4, 8, 16, 32, 64, 128, 256};
     bool logger_debug = (logger_get_level(raop_ntp->logger) >= LOGGER_DEBUG);
@@ -297,17 +305,19 @@ raop_ntp_thread(void *arg)
 
         // Send request
         uint64_t send_time = raop_ntp_get_local_time();
-        byteutils_put_ntp_timestamp(request, 24, send_time);
-        if (recv_time) {
+        int transmit_offset =
+            (raop_ntp->time_protocol == NTP_LEGACY) ? 40 : 24;
+        byteutils_put_ntp_timestamp(request, transmit_offset, send_time);
+        if (recv_time && raop_ntp->time_protocol != NTP_LEGACY) {
             byteutils_put_long_be(request, 8, client_ref_time);
             byteutils_put_ntp_timestamp(request, 16, recv_time);
         }
-        int send_len = sendto(raop_ntp->tsock, (char *)request, sizeof(request), 0,
+        int send_len = sendto(raop_ntp->tsock, (char *)request, request_len, 0,
                               (struct sockaddr *) &raop_ntp->remote_saddr, raop_ntp->remote_saddr_len);
         if (logger_debug) {
-            char *str = utils_data_to_string(request, sizeof(request), 16);
+            char *str = utils_data_to_string(request, request_len, 16);
             logger_log(raop_ntp->logger, LOGGER_DEBUG, "\nraop_ntp send time type_t=%d packetlen = %d, now = %8.6f\n%s",
-                       request[1] &~0x80, sizeof(request), (double) send_time / SECOND_IN_NSECS, str);
+                       request[1] &~0x80, request_len, (double) send_time / SECOND_IN_NSECS, str);
             free(str);
         }
         if (send_len < 0) {
@@ -323,7 +333,15 @@ raop_ntp_thread(void *arg)
                 logger_log(raop_ntp->logger, LOGGER_DEBUG , "raop_ntp receive timeout (request sent %s)", time);
 	    } else {
                 recv_time = raop_ntp_get_local_time();
-                client_ref_time = byteutils_get_long_be(response, 24);
+                bool legacy_ntp = raop_ntp->time_protocol == NTP_LEGACY;
+                if ((legacy_ntp && response_len < 48) ||
+                    (!legacy_ntp && response_len < 32)) {
+                    logger_log(raop_ntp->logger, LOGGER_WARNING,
+                               "Short timing response: %d bytes", response_len);
+                    goto wait_for_next_request;
+                }
+                client_ref_time = byteutils_get_long_be(
+                    response, legacy_ntp ? 40 : 24);
                 if (!raop_ntp->client_time_received) {
                     raop_ntp->client_time_received = true;
                 }
@@ -331,13 +349,18 @@ raop_ntp_thread(void *arg)
                 int64_t t3 = (int64_t) recv_time;
 
                 // Local time of the server when the NTP request packet leaves the server
-                int64_t t0 = (int64_t) byteutils_get_ntp_timestamp(response, 8);
+                int64_t t0 = (int64_t) byteutils_get_ntp_timestamp(
+                    response, legacy_ntp ? 24 : 8);
 
                 // Local time of the client when the NTP request packet arrives at the client
-                int64_t t1 = (int64_t) raop_remote_timestamp_to_nano_seconds(raop_ntp, byteutils_get_long_be(response, 16));
+                int64_t t1 = (int64_t) raop_remote_timestamp_to_nano_seconds(
+                    raop_ntp, byteutils_get_long_be(response,
+                                                    legacy_ntp ? 32 : 16));
 
                 // Local time of the client when the response message leaves the client
-                int64_t t2 = (int64_t) raop_remote_timestamp_to_nano_seconds(raop_ntp, byteutils_get_long_be(response, 24));
+                int64_t t2 = (int64_t) raop_remote_timestamp_to_nano_seconds(
+                    raop_ntp, byteutils_get_long_be(response,
+                                                    legacy_ntp ? 40 : 24));
 
                 if (logger_debug) {
                     char *str = utils_data_to_string(response, response_len, 16);                   
@@ -383,6 +406,7 @@ raop_ntp_thread(void *arg)
             }
         }
 
+wait_for_next_request:
         // Sleep for 3 seconds
         struct timespec wait_time;
         MUTEX_LOCK(raop_ntp->wait_mutex);
@@ -489,7 +513,10 @@ uint64_t raop_ntp_timestamp_to_nano_seconds(uint64_t ntp_timestamp, bool account
 
 uint64_t raop_remote_timestamp_to_nano_seconds(raop_ntp_t *raop_ntp, uint64_t timestamp) {
     uint64_t seconds = ((timestamp >> 32) & 0xffffffff);
-    if (raop_ntp->time_protocol == NTP) seconds -= SECONDS_FROM_1900_TO_1970;
+    if (raop_ntp->time_protocol == NTP ||
+        raop_ntp->time_protocol == NTP_LEGACY) {
+        seconds -= SECONDS_FROM_1900_TO_1970;
+    }
     uint64_t fraction = (timestamp & 0xffffffff);
     return (seconds * SECOND_IN_NSECS) + ((fraction * SECOND_IN_NSECS) >> 32);
 }

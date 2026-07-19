@@ -104,6 +104,7 @@ struct raop_rtp_mirror_s {
 
     /* MUTEX LOCKED VARIABLES END */
     int mirror_data_sock;
+    int legacy_stream_fd;
 
     unsigned short mirror_data_lport;
 
@@ -161,6 +162,8 @@ raop_rtp_mirror_t *raop_rtp_mirror_init(logger_t *logger, raop_callbacks_t *call
     raop_rtp_mirror->running = 0;
     raop_rtp_mirror->joined = 1;
     raop_rtp_mirror->flush = NO_FLUSH;
+    raop_rtp_mirror->mirror_data_sock = -1;
+    raop_rtp_mirror->legacy_stream_fd = -1;
 
     MUTEX_CREATE(raop_rtp_mirror->run_mutex);
     return raop_rtp_mirror;
@@ -170,6 +173,13 @@ void
 raop_rtp_mirror_init_aes(raop_rtp_mirror_t *raop_rtp_mirror, uint64_t *streamConnectionID)
 {
     mirror_buffer_init_aes(raop_rtp_mirror->buffer, streamConnectionID);
+}
+
+void
+raop_rtp_mirror_init_legacy_aes(raop_rtp_mirror_t *raop_rtp_mirror,
+                                const unsigned char *aesiv)
+{
+    mirror_buffer_init_legacy_aes(raop_rtp_mirror->buffer, aesiv);
 }
 
 #define RAOP_PACKET_LEN 32768
@@ -182,7 +192,7 @@ raop_rtp_mirror_thread(void *arg)
     raop_rtp_mirror_t *raop_rtp_mirror = arg;
     assert(raop_rtp_mirror);
 
-    int stream_fd = -1;
+    int stream_fd = raop_rtp_mirror->legacy_stream_fd;
     unsigned char packet[128] = {0};
     unsigned char* sps_pps = NULL;
     bool prepend_sps_pps = false;
@@ -836,6 +846,9 @@ raop_rtp_mirror_thread(void *arg)
     if (stream_fd != -1) {
         CLOSESOCKET(stream_fd);
     }
+    MUTEX_LOCK(raop_rtp_mirror->run_mutex);
+    raop_rtp_mirror->legacy_stream_fd = -1;
+    MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
 
     // Ensure running reflects the actual state
     MUTEX_LOCK(raop_rtp_mirror->run_mutex);
@@ -928,6 +941,46 @@ raop_rtp_mirror_start(raop_rtp_mirror_t *raop_rtp_mirror, unsigned short *mirror
 
     THREAD_CREATE(raop_rtp_mirror->thread_mirror, raop_rtp_mirror_thread, raop_rtp_mirror);
     MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
+}
+
+int
+raop_rtp_mirror_start_fd(raop_rtp_mirror_t *raop_rtp_mirror, int stream_fd,
+                         uint8_t show_client_FPS_data)
+{
+    assert(raop_rtp_mirror);
+    if (stream_fd < 0) {
+        return -1;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 5000;
+    if (setsockopt(stream_fd, SOL_SOCKET, SO_RCVTIMEO, CAST &tv,
+                   sizeof(tv)) < 0) {
+        logger_log(raop_rtp_mirror->logger, LOGGER_WARNING,
+                   "Could not set legacy mirror stream timeout");
+    }
+
+    MUTEX_LOCK(raop_rtp_mirror->run_mutex);
+    if (raop_rtp_mirror->running || !raop_rtp_mirror->joined) {
+        MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
+        return -1;
+    }
+    raop_rtp_mirror->show_client_FPS_data = show_client_FPS_data;
+    raop_rtp_mirror->legacy_stream_fd = stream_fd;
+    raop_rtp_mirror->running = 1;
+    raop_rtp_mirror->joined = 0;
+    if (raop_rtp_mirror->callbacks.mirror_video_running) {
+        raop_rtp_mirror->callbacks.mirror_video_running(
+            raop_rtp_mirror->callbacks.cls, true);
+    }
+    THREAD_CREATE(raop_rtp_mirror->thread_mirror, raop_rtp_mirror_thread,
+                  raop_rtp_mirror);
+    MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
+
+    logger_log(raop_rtp_mirror->logger, LOGGER_INFO,
+               "Legacy iOS H.264 mirror stream started");
+    return 0;
 }
 
 void raop_rtp_mirror_stop(raop_rtp_mirror_t *raop_rtp_mirror) {

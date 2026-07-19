@@ -31,6 +31,11 @@
 #include "compat.h"
 #include "raop_rtp_mirror.h"
 #include "raop_ntp.h"
+#include "legacy_mirror.h"
+#include "crypto.h"
+#include "sdp.h"
+#include "utils.h"
+#include <plist/plist.h>
 
 
 /* libplist-2.3.0  API change */
@@ -52,6 +57,7 @@ struct raop_s {
     /* Pairing, HTTP daemon and RSA key */
     pairing_t *pairing;
     httpd_t *httpd;
+    legacy_mirror_t *legacy_mirror;
 
     dnssd_t *dnssd;
 
@@ -119,8 +125,136 @@ struct raop_conn_s {
     char *client_session_id;
     bool authenticated;
     bool have_active_remote;
+
+    bool legacy_audio_announced;
+    unsigned char legacy_aeskey[16];
+    unsigned char legacy_aesiv[16];
+    unsigned char legacy_audio_ct;
+    unsigned int legacy_audio_sample_rate;
 };
 typedef struct raop_conn_s raop_conn_t;
+
+static int
+raop_ensure_legacy_ntp(raop_conn_t *conn, unsigned short timing_rport)
+{
+    if (conn->raop_ntp) {
+        return 0;
+    }
+    raop_t *raop = conn->raop;
+    char remote[40] = {0};
+    int len = utils_ipaddress_to_string(conn->remotelen, conn->remote,
+                                        conn->zone_id, remote,
+                                        (int) sizeof(remote));
+    if (!len || len > (int) sizeof(remote)) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "Could not determine iOS 6 client address");
+        return -1;
+    }
+
+    timing_protocol_t protocol = NTP_LEGACY;
+    conn->raop_ntp = raop_ntp_init(raop->logger, &raop->callbacks, remote,
+                                   conn->remotelen,
+                                   timing_rport ? timing_rport : 7010,
+                                   &protocol);
+    if (!conn->raop_ntp) {
+        return -1;
+    }
+    unsigned short local_port = raop->timing_lport;
+    raop_ntp_start(conn->raop_ntp, &local_port);
+    raop->timing_lport = local_port;
+    return 0;
+}
+
+static int
+raop_legacy_stream_start(void *opaque, int stream_fd, const char *body,
+                         size_t body_len)
+{
+    raop_t *raop = opaque;
+    plist_t root = NULL;
+    plist_from_bin(body, (uint32_t) body_len, &root);
+    if (!root) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "Invalid iOS 6 /stream binary plist");
+        return -1;
+    }
+
+    plist_t param1_node = plist_dict_get_item(root, "param1");
+    plist_t param2_node = plist_dict_get_item(root, "param2");
+    char *param1 = NULL;
+    char *param2 = NULL;
+    uint64_t param1_len = 0;
+    uint64_t param2_len = 0;
+    if (param1_node) plist_get_data_val(param1_node, &param1, &param1_len);
+    if (param2_node) plist_get_data_val(param2_node, &param2, &param2_len);
+    if (param1_len != 72 || param2_len != 16) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "Invalid iOS 6 video key material (%llu/%llu bytes)",
+                   param1_len, param2_len);
+        free(param1);
+        free(param2);
+        plist_free(root);
+        return -1;
+    }
+
+    raop_conn_t *conn = httpd_get_connection_by_type(
+        raop->httpd, CONNECTION_TYPE_RAOP, 1);
+    if (!conn) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "iOS 6 /stream arrived without an active RTSP session");
+        free(param1);
+        free(param2);
+        plist_free(root);
+        return -1;
+    }
+
+    unsigned char aeskey[16] = {0};
+    if (fairplay_decrypt(conn->fairplay, (unsigned char *) param1, aeskey) &&
+        legacy_mirror_decrypt_key(raop->legacy_mirror,
+                                  (unsigned char *) param1, aeskey)) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "Could not decrypt iOS 6 video key");
+        free(param1);
+        free(param2);
+        plist_free(root);
+        return -1;
+    }
+    free(param1);
+
+    if (raop_ensure_legacy_ntp(conn, 7010)) {
+        free(param2);
+        plist_free(root);
+        return -1;
+    }
+    if (conn->raop_rtp_mirror) {
+        raop_rtp_mirror_destroy(conn->raop_rtp_mirror);
+        conn->raop_rtp_mirror = NULL;
+    }
+
+    char remote[40] = {0};
+    utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id,
+                              remote, (int) sizeof(remote));
+    conn->raop_rtp_mirror = raop_rtp_mirror_init(
+        raop->logger, &raop->callbacks, conn->raop_ntp, remote,
+        conn->remotelen, aeskey);
+    if (!conn->raop_rtp_mirror) {
+        free(param2);
+        plist_free(root);
+        return -1;
+    }
+    raop_rtp_mirror_init_legacy_aes(conn->raop_rtp_mirror,
+                                    (unsigned char *) param2);
+    free(param2);
+    plist_free(root);
+    raop_destroy_airplay_video(raop, -1);
+
+    if (raop_rtp_mirror_start_fd(conn->raop_rtp_mirror, stream_fd,
+                                 raop->clientFPSdata)) {
+        raop_rtp_mirror_destroy(conn->raop_rtp_mirror);
+        conn->raop_rtp_mirror = NULL;
+        return -1;
+    }
+    return 0;
+}
 
 #include "raop_handlers.h"
 #include "http_handlers.h"
@@ -178,6 +312,8 @@ conn_init(void *opaque, unsigned char *local, int locallen, unsigned char *remot
     conn->authenticated = false;
 
     conn->have_active_remote = false;
+    conn->legacy_audio_ct = 8;
+    conn->legacy_audio_sample_rate = 44100;
     
     if (raop->callbacks.conn_init) {
         raop->callbacks.conn_init(raop->callbacks.cls);
@@ -424,6 +560,8 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
             }
         } else if (!strcmp(method, "OPTIONS")) {
             handler = &raop_handler_options;
+        } else if (!strcmp(method, "ANNOUNCE")) {
+            handler = &raop_handler_announce;
         } else if (!strcmp(method, "SETUP")) {
             raop->hls_pending = false;
             handler = &raop_handler_setup;
@@ -613,6 +751,7 @@ raop_init(raop_callbacks_t *callbacks) {
     raop->control_lport = 0;
     raop->data_lport = 0;
     raop->mirror_data_lport = 0;
+    raop->legacy_mirror = NULL;
 
     /* initialize configurable plist parameters */
     raop->width = 1920;
@@ -696,6 +835,8 @@ raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile)
 void
 raop_destroy(raop_t *raop) {
     if (raop) {
+        legacy_mirror_destroy(raop->legacy_mirror);
+        raop->legacy_mirror = NULL;
         raop_destroy_airplay_video(raop, -1);
         raop_stop_httpd(raop);
         pairing_destroy(raop->pairing);
@@ -841,6 +982,29 @@ raop_start_httpd(raop_t *raop, unsigned short *port) {
     assert(raop);
     assert(port);
     return httpd_start(raop->httpd, port);
+}
+
+int
+raop_start_legacy_mirror(raop_t *raop, unsigned short *port)
+{
+    assert(raop);
+    assert(port);
+    if (!raop->legacy_mirror) {
+        raop->legacy_mirror = legacy_mirror_init(
+            raop->logger, raop->width, raop->height, raop->refreshRate,
+            raop->overscanned, raop_legacy_stream_start, raop);
+    }
+    if (!raop->legacy_mirror) {
+        return -1;
+    }
+    return legacy_mirror_start(raop->legacy_mirror, port);
+}
+
+void
+raop_stop_legacy_mirror(raop_t *raop)
+{
+    assert(raop);
+    legacy_mirror_stop(raop->legacy_mirror);
 }
 
 void

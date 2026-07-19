@@ -177,6 +177,7 @@ static bool h265_support = false;
 static int n_video_renderers = 0;
 static int n_audio_renderers = 0;
 static bool hls_support = false;
+static bool ios6_legacy_mode = false;
 static std::string lang = "";
 static std::string url = "";
 static guint gst_x11_window_id = 0;
@@ -940,6 +941,8 @@ static void print_info (char *name) {
     printf("-o        Set display \"overscanned\" mode on (not usually needed)\n");
     printf("-fs       Full-screen (only with X11, Wayland, VAAPI, D3D11/12, kms)\n");
     printf("-p        Use legacy ports UDP 6000:6001:7011 TCP 7000:7001:7100\n");
+    printf("-ios6     Enable iOS 5/6 mirroring protocol on fixed TCP 7100\n");
+    printf("          (also selects the legacy UDP/TCP port set used by Apple TV 5.x)\n");
     printf("-p n      Use TCP and UDP ports n,n+1,n+2. range %d-%d\n", LOWEST_ALLOWED_PORT, HIGHEST_PORT);
     printf("          use \"-p n1,n2,n3\" to set each port, \"n1,n2\" for n3 = n2+1\n");
     printf("          \"-p tcp n\" or \"-p udp n\" sets TCP or UDP ports separately\n");
@@ -1345,6 +1348,8 @@ static void parse_arguments (int argc, char *argv[]) {
                     udp[j] = tcp[j];
                 }
             }
+        } else if (arg == "-ios6") {
+            ios6_legacy_mode = true;
         } else if (arg == "-m") {
             if (i < argc - 1 && *argv[i+1] != '-') {
                 if (validate_mac(argv[++i])) {
@@ -2748,6 +2753,18 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_start_httpd(raop, &raop_port);
     raop_set_port(raop, raop_port);
 
+    if (ios6_legacy_mode) {
+        unsigned short legacy_port = tcp[0];
+        if (raop_start_legacy_mirror(raop, &legacy_port)) {
+            LOGE("Could not start iOS 6 mirror service on TCP %u",
+                 tcp[0]);
+            raop_destroy(raop);
+            raop = NULL;
+            return -1;
+        }
+        tcp[0] = legacy_port;
+    }
+
     /* use raop_port for airplay_port (instead of tcp[2]) */
     airplay_port = raop_port;
 
@@ -2928,6 +2945,18 @@ int main (int argc, char *argv[]) {
         read_config_file(config_file.c_str(), argv[0]);
     }
     parse_arguments (argc, argv);
+
+    if (ios6_legacy_mode) {
+        tcp[0] = 7100;
+        tcp[1] = 7000;
+        tcp[2] = 7001;
+        udp[0] = 7011;
+        udp[1] = 6001;
+        udp[2] = 6000;
+        setup_legacy_pairing = false;
+        h265_support = false;
+        LOGI("iOS 5/6 compatibility mode enabled");
+    }
 
     log_level = (debug_log ? LOGGER_DEBUG_DATA : LOGGER_INFO);
     if (debug_log && suppress_packet_debug_data) {

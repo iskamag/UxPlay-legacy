@@ -25,7 +25,13 @@
 
 typedef struct raop_ntp_s raop_ntp_t;
 
-typedef enum timing_protocol_e { NTP, TP_NONE, TP_OTHER, TP_UNSPECIFIED } timing_protocol_t;
+typedef enum timing_protocol_e {
+    NTP,
+    NTP_LEGACY,
+    TP_NONE,
+    TP_OTHER,
+    TP_UNSPECIFIED
+} timing_protocol_t;
 
 void raop_ntp_start(raop_ntp_t *raop_ntp, unsigned short *timing_lport);
 

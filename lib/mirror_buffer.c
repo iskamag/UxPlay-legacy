@@ -67,6 +67,21 @@ mirror_buffer_init_aes(mirror_buffer_t *mirror_buffer, const uint64_t *streamCon
     mirror_buffer->aes_ctx = aes_ctr_init(aeskey_video, aesiv_video);
 }
 
+void
+mirror_buffer_init_legacy_aes(mirror_buffer_t *mirror_buffer,
+                              const unsigned char *aesiv)
+{
+    assert(mirror_buffer);
+    assert(aesiv);
+
+    if (mirror_buffer->aes_ctx) {
+        aes_ctr_destroy(mirror_buffer->aes_ctx);
+    }
+    /* AirPlay 130.x passes the video key as FairPlay-encrypted param1 and
+     * the AES-CTR IV directly as param2.  It predates streamConnectionID. */
+    mirror_buffer->aes_ctx = aes_ctr_init(mirror_buffer->aeskey_audio, aesiv);
+}
+
 mirror_buffer_t *
 mirror_buffer_init(logger_t *logger, const unsigned char *aeskey)
 {

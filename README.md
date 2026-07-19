@@ -1,5 +1,9 @@
 # UxPlay 1.74 (Experimental): AirPlay-Mirror and AirPlay-Audio server for Linux, macOS, and Unix (also runs on Windows).
 
+This fork adds an explicit `-ios6` compatibility mode for the Apple TV 5.x
+mirroring protocol used by iOS 5 and iOS 6. See [IOS6.md](IOS6.md) for the
+build, run, and capture workflow.
+
 ### **Now developed at the GitHub site <https://github.com/FDH2/UxPlay> (where ALL user issues should be posted, and latest versions can be found).**
 
 -   **NEW in v 1.74 (Experimental) (June 2026)

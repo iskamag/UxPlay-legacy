@@ -600,6 +600,37 @@ char *get_md5(char *string) {
 int get_random_bytes(unsigned char *buf, int num) {
     return RAND_bytes(buf, num);
 }
+
+int base64_decode(const char *input, unsigned char *output, size_t output_size) {
+    if (!input || !output) {
+        return -1;
+    }
+    size_t input_len = strlen(input);
+    if (!input_len || input_len % 4) {
+        return -1;
+    }
+    size_t padding = 0;
+    if (input[input_len - 1] == '=') padding++;
+    if (input_len > 1 && input[input_len - 2] == '=') padding++;
+    size_t block_size = (input_len / 4) * 3;
+    if (output_size < block_size - padding) return -1;
+
+    /* EVP_DecodeBlock writes the padded block size, so decode into a
+     * temporary buffer before copying the actual payload to a 16-byte IV. */
+    unsigned char *decoded_block = malloc(block_size);
+    if (!decoded_block) return -1;
+    int decoded = EVP_DecodeBlock(decoded_block,
+                                  (const unsigned char *) input,
+                                  (int) input_len);
+    if (decoded < 0) {
+        free(decoded_block);
+        return -1;
+    }
+    decoded -= (int) padding;
+    memcpy(output, decoded_block, (size_t) decoded);
+    free(decoded_block);
+    return decoded;
+}
 #include <stdio.h>
 void pk_to_base64(const unsigned char *pk, int pk_len, char *pk_base64, int len) {
     memset(pk_base64, 0, len);
