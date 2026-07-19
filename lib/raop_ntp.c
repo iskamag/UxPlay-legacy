@@ -370,9 +370,13 @@ raop_ntp_thread(void *arg)
                                (double) t2 / SECOND_IN_NSECS, str); 
                     free(str);
                 }
-                // The iOS client device sends its time in  seconds relative to an arbitrary Epoch (the last boot).
-                // For a little bonus confusion, they add SECONDS_FROM_1900_TO_1970.
-                // This means we have to expect some rather huge offset, but its growth or shrink over time should be small.
+                // The iOS client device sends its time in seconds relative
+                // to an arbitrary Epoch (the last boot).  Modern AirPlay
+                // (NTP mode) additionally wraps this in the full NTP epoch
+                // by adding SECONDS_FROM_1900_TO_1970, but iOS 5/6
+                // (NTP_LEGACY) sends the raw uptime.  In both cases the
+                // offset between the remote and local clocks is huge but
+                // stable, which is all that matters for conversion.
 
                 raop_ntp->data_index = (raop_ntp->data_index + 1) % RAOP_NTP_DATA_COUNT;
                 raop_ntp->data[raop_ntp->data_index].time = t3;
@@ -513,10 +517,16 @@ uint64_t raop_ntp_timestamp_to_nano_seconds(uint64_t ntp_timestamp, bool account
 
 uint64_t raop_remote_timestamp_to_nano_seconds(raop_ntp_t *raop_ntp, uint64_t timestamp) {
     uint64_t seconds = ((timestamp >> 32) & 0xffffffff);
-    if (raop_ntp->time_protocol == NTP ||
-        raop_ntp->time_protocol == NTP_LEGACY) {
+    if (raop_ntp->time_protocol == NTP) {
+        /* Modern AirPlay: the client wraps its uptime in the full NTP
+         * epoch (adds SECONDS_FROM_1900_TO_1970), so we subtract it back
+         * to get Unix-epoch seconds. */
         seconds -= SECONDS_FROM_1900_TO_1970;
     }
+    /* NTP_LEGACY (iOS 5/6): the client sends raw monotonic time without
+     * any epoch wrapping.  The offset math in raop_ntp_convert_remote_time
+     * only needs t1/t2 to be in the remote's own units; subtracting the
+     * NTP epoch here would underflow and corrupt the clock sync. */
     uint64_t fraction = (timestamp & 0xffffffff);
     return (seconds * SECOND_IN_NSECS) + ((fraction * SECOND_IN_NSECS) >> 32);
 }
