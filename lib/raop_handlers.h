@@ -646,17 +646,28 @@ static int
 raop_legacy_transport_port(const char *transport, const char *name,
                            unsigned short *port)
 {
+    /* A legacy sender may omit a port or explicitly advertise port zero.
+     * Zero disables that auxiliary channel (normally audio resends); it is
+     * not a malformed Transport header.  Distinguish missing (0), present
+     * (1), and malformed (-1) so SETUP can handle all three cases. */
     const char *field = strstr(transport, name);
     if (!field) {
-        return -1;
+        return 0;
     }
     field += strlen(name);
-    unsigned long value = strtoul(field, NULL, 10);
-    if (!value || value > 65535) {
+    char *end = NULL;
+    unsigned long value = strtoul(field, &end, 10);
+    if (end == field || value > 65535) {
+        return -1;
+    }
+    while (*end && isspace((unsigned char) *end)) {
+        end++;
+    }
+    if (*end && *end != ';') {
         return -1;
     }
     *port = (unsigned short) value;
-    return 0;
+    return 1;
 }
 
 static void
@@ -667,15 +678,24 @@ raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
     const char *transport = http_request_get_header(request, "Transport");
     unsigned short remote_cport = 0;
     unsigned short remote_tport = 7010;
-    if (!transport ||
-        raop_legacy_transport_port(transport, "control_port=",
-                                   &remote_cport)) {
+    if (!transport) {
         logger_log(raop->logger, LOGGER_ERR,
-                   "Invalid iOS 6 SETUP Transport header");
+                   "iOS 6 SETUP has no Transport header");
         http_response_init(response, "RTSP/1.0", 400, "Bad Request");
         return;
     }
-    raop_legacy_transport_port(transport, "timing_port=", &remote_tport);
+    logger_log(raop->logger, LOGGER_INFO,
+               "iOS 6 SETUP Transport: %s", transport);
+    int control_status = raop_legacy_transport_port(
+        transport, "control_port=", &remote_cport);
+    int timing_status = raop_legacy_transport_port(
+        transport, "timing_port=", &remote_tport);
+    if (control_status < 0 || timing_status < 0) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "Malformed iOS 6 SETUP port in Transport header");
+        http_response_init(response, "RTSP/1.0", 400, "Bad Request");
+        return;
+    }
     if (!conn->legacy_audio_announced) {
         logger_log(raop->logger, LOGGER_ERR,
                    "iOS 6 SETUP arrived before ANNOUNCE");
@@ -689,29 +709,32 @@ raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
         return;
     }
 
-    if (conn->raop_rtp) {
-        raop_rtp_destroy(conn->raop_rtp);
-    }
-    char remote[40] = {0};
-    utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id,
-                              remote, (int) sizeof(remote));
-    conn->raop_rtp = raop_rtp_init(
-        raop->logger, &raop->callbacks, conn->raop_ntp, remote,
-        conn->remotelen, conn->legacy_aeskey, conn->legacy_aesiv);
-    if (!conn->raop_rtp) {
-        http_response_init(response, "RTSP/1.0", 500,
-                           "Internal Server Error");
-        return;
-    }
-
     unsigned short control_lport = raop->control_lport;
     unsigned short data_lport = raop->data_lport;
-    unsigned char ct = conn->legacy_audio_ct;
-    unsigned int sample_rate = conn->legacy_audio_sample_rate;
-    raop_rtp_start_audio(conn->raop_rtp, &remote_cport, &control_lport,
-                         &data_lport, &ct, &sample_rate);
-    raop->control_lport = control_lport;
-    raop->data_lport = data_lport;
+    if (!conn->raop_rtp) {
+        char remote[40] = {0};
+        utils_ipaddress_to_string(conn->remotelen, conn->remote,
+                                  conn->zone_id, remote,
+                                  (int) sizeof(remote));
+        conn->raop_rtp = raop_rtp_init(
+            raop->logger, &raop->callbacks, conn->raop_ntp, remote,
+            conn->remotelen, conn->legacy_aeskey, conn->legacy_aesiv);
+        if (!conn->raop_rtp) {
+            http_response_init(response, "RTSP/1.0", 500,
+                               "Internal Server Error");
+            return;
+        }
+        unsigned char ct = conn->legacy_audio_ct;
+        unsigned int sample_rate = conn->legacy_audio_sample_rate;
+        raop_rtp_start_audio(conn->raop_rtp, &remote_cport,
+                             &control_lport, &data_lport, &ct,
+                             &sample_rate);
+        raop->control_lport = control_lport;
+        raop->data_lport = data_lport;
+    } else {
+        logger_log(raop->logger, LOGGER_INFO,
+                   "Reusing iOS 6 audio receiver for repeated SETUP");
+    }
 
     char response_transport[256];
     snprintf(response_transport, sizeof(response_transport),

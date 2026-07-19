@@ -1,12 +1,13 @@
-/**
- * Copyright (C) 2011-2012 Juho Vähä-Herttua
+/*
+ * Copyright (C) 2026 Iska Mag
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or
  * later.
  */
-#ifndef SDP_H
-#define SDP_H
+
+#ifndef UXPLAY_LEGACY_SDP_H
+#define UXPLAY_LEGACY_SDP_H
 
 typedef struct sdp_s sdp_t;
 

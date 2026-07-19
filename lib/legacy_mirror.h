@@ -1,4 +1,6 @@
 /*
+ * Copyright (C) 2026 Iska Mag
+ *
  * Legacy AirPlay Mirroring (Apple TV software 5.x / iOS 5-6).
  *
  * This compatibility listener owns the protocol's fixed TCP port 7100.

@@ -1,56 +1,103 @@
-/**
- * Copyright (C) 2011-2012 Juho Vähä-Herttua
+/*
+ * Copyright (C) 2026 Iska Mag
  *
  * This library is free software; you can redistribute it and/or modify it
  * under the terms of the GNU Lesser General Public License version 2.1 or
  * later.
  */
+
 #include "sdp.h"
 
-#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
+typedef enum {
+    SDP_CONNECTION,
+    SDP_RTPMAP,
+    SDP_FMTP,
+    SDP_FPAESKEY,
+    SDP_AESIV,
+    SDP_MIN_LATENCY,
+    SDP_VALUE_COUNT
+} sdp_value_t;
+
 struct sdp_s {
-    char *data;
-    const char *connection;
-    const char *rtpmap;
-    const char *fmtp;
-    const char *fpaeskey;
-    const char *aesiv;
-    const char *min_latency;
+    char *storage;
+    const char *values[SDP_VALUE_COUNT];
 };
 
-static void
-sdp_parse_line(sdp_t *sdp, char *line)
+typedef struct {
+    const char *name;
+    sdp_value_t value;
+} sdp_attribute_t;
+
+static const sdp_attribute_t sdp_attributes[] = {
+    { "rtpmap", SDP_RTPMAP },
+    { "fmtp", SDP_FMTP },
+    { "fpaeskey", SDP_FPAESKEY },
+    { "aesiv", SDP_AESIV },
+    { "min-latency", SDP_MIN_LATENCY }
+};
+
+static char *
+sdp_take_line(char **cursor)
 {
-    if (strlen(line) < 2 || line[1] != '=') {
+    if (!cursor || !*cursor || !**cursor) {
+        return NULL;
+    }
+
+    char *line = *cursor;
+    char *end = line;
+    while (*end && *end != '\r' && *end != '\n') {
+        end++;
+    }
+    if (!*end) {
+        *cursor = NULL;
+        return line;
+    }
+
+    *end++ = '\0';
+    while (*end == '\r' || *end == '\n') {
+        end++;
+    }
+    *cursor = end;
+    return line;
+}
+
+static void
+sdp_read_line(sdp_t *sdp, char *line)
+{
+    if (!line || !line[0] || line[1] != '=') {
         return;
     }
     if (line[0] == 'c') {
-        sdp->connection = line + 2;
+        if (!sdp->values[SDP_CONNECTION]) {
+            sdp->values[SDP_CONNECTION] = line + 2;
+        }
         return;
     }
     if (line[0] != 'a') {
         return;
     }
 
-    char *key = line + 2;
-    char *value = strchr(key, ':');
+    char *name = line + 2;
+    char *value = strchr(name, ':');
     if (!value) {
         return;
     }
     *value++ = '\0';
-    if (!strcmp(key, "rtpmap") && !sdp->rtpmap) {
-        sdp->rtpmap = value;
-    } else if (!strcmp(key, "fmtp") && !sdp->fmtp) {
-        sdp->fmtp = value;
-    } else if (!strcmp(key, "fpaeskey")) {
-        sdp->fpaeskey = value;
-    } else if (!strcmp(key, "aesiv")) {
-        sdp->aesiv = value;
-    } else if (!strcmp(key, "min-latency")) {
-        sdp->min_latency = value;
+    while (*value == ' ' || *value == '\t') {
+        value++;
+    }
+
+    size_t count = sizeof(sdp_attributes) / sizeof(sdp_attributes[0]);
+    for (size_t i = 0; i < count; i++) {
+        const sdp_attribute_t *attribute = &sdp_attributes[i];
+        if (!strcmp(name, attribute->name) &&
+            !sdp->values[attribute->value]) {
+            sdp->values[attribute->value] = value;
+            return;
+        }
     }
 }
 
@@ -60,30 +107,23 @@ sdp_init(const char *data, int length)
     if (!data || length <= 0) {
         return NULL;
     }
+
     sdp_t *sdp = calloc(1, sizeof(*sdp));
     if (!sdp) {
         return NULL;
     }
-    sdp->data = malloc((size_t) length + 1);
-    if (!sdp->data) {
+    sdp->storage = malloc((size_t) length + 1);
+    if (!sdp->storage) {
         free(sdp);
         return NULL;
     }
-    memcpy(sdp->data, data, (size_t) length);
-    sdp->data[length] = '\0';
+    memcpy(sdp->storage, data, (size_t) length);
+    sdp->storage[length] = '\0';
 
-    char *line = sdp->data;
-    while (line && *line) {
-        char *next = strchr(line, '\n');
-        if (next) {
-            *next++ = '\0';
-        }
-        size_t line_len = strlen(line);
-        if (line_len && line[line_len - 1] == '\r') {
-            line[line_len - 1] = '\0';
-        }
-        sdp_parse_line(sdp, line);
-        line = next;
+    char *cursor = sdp->storage;
+    char *line = NULL;
+    while ((line = sdp_take_line(&cursor)) != NULL) {
+        sdp_read_line(sdp, line);
     }
     return sdp;
 }
@@ -91,22 +131,45 @@ sdp_init(const char *data, int length)
 void
 sdp_destroy(sdp_t *sdp)
 {
-    if (sdp) {
-        free(sdp->data);
-        free(sdp);
+    if (!sdp) {
+        return;
     }
+    free(sdp->storage);
+    free(sdp);
 }
 
-#define SDP_GETTER(name, field)                  \
-    const char *sdp_get_##name(sdp_t *sdp)       \
-    {                                             \
-        assert(sdp);                              \
-        return sdp->field;                        \
-    }
+static const char *
+sdp_get_value(const sdp_t *sdp, sdp_value_t value)
+{
+    return sdp ? sdp->values[value] : NULL;
+}
 
-SDP_GETTER(connection, connection)
-SDP_GETTER(rtpmap, rtpmap)
-SDP_GETTER(fmtp, fmtp)
-SDP_GETTER(fpaeskey, fpaeskey)
-SDP_GETTER(aesiv, aesiv)
-SDP_GETTER(min_latency, min_latency)
+const char *sdp_get_connection(sdp_t *sdp)
+{
+    return sdp_get_value(sdp, SDP_CONNECTION);
+}
+
+const char *sdp_get_rtpmap(sdp_t *sdp)
+{
+    return sdp_get_value(sdp, SDP_RTPMAP);
+}
+
+const char *sdp_get_fmtp(sdp_t *sdp)
+{
+    return sdp_get_value(sdp, SDP_FMTP);
+}
+
+const char *sdp_get_fpaeskey(sdp_t *sdp)
+{
+    return sdp_get_value(sdp, SDP_FPAESKEY);
+}
+
+const char *sdp_get_aesiv(sdp_t *sdp)
+{
+    return sdp_get_value(sdp, SDP_AESIV);
+}
+
+const char *sdp_get_min_latency(sdp_t *sdp)
+{
+    return sdp_get_value(sdp, SDP_MIN_LATENCY);
+}

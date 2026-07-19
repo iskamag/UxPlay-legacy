@@ -1,4 +1,6 @@
 /*
+ * Copyright (C) 2026 Iska Mag
+ *
  * Legacy AirPlay Mirroring discovery/stream listener.
  *
  * iOS 5 and iOS 6 query GET /stream.xml on a fixed TCP port (normally 7100)
