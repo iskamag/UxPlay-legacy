@@ -752,7 +752,7 @@ raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
                                       conn->zone_id, remote,
                                       (int) sizeof(remote));
             conn->raop_rtp = raop_rtp_init(
-                raop->logger, &raop->callbacks, conn->raop_ntp, remote,
+                raop->logger, &raop->callbacks, raop->legacy_ntp, remote,
                 conn->remotelen, conn->legacy_aeskey, conn->legacy_aesiv);
             if (!conn->raop_rtp) {
                 http_response_init(response, "RTSP/1.0", 500,
@@ -778,18 +778,18 @@ raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
              "control_port=%u;timing_port=%u",
              transport_spec, screen_mode ? "screen" : "record",
              data_lport, control_lport,
-             raop_ntp_get_port(conn->raop_ntp));
+             raop_ntp_get_port(raop->legacy_ntp));
     http_response_add_header(response, "Transport", response_transport);
     http_response_add_header(response, "Session", "1");
     if (screen_mode) {
         logger_log(raop->logger, LOGGER_INFO,
                    "iOS 6 screen SETUP: timing UDP %u",
-                   raop_ntp_get_port(conn->raop_ntp));
+                   raop_ntp_get_port(raop->legacy_ntp));
     } else {
         logger_log(raop->logger, LOGGER_INFO,
                    "iOS 6 audio listening on UDP %u/%u; timing UDP %u",
                    data_lport, control_lport,
-                   raop_ntp_get_port(conn->raop_ntp));
+                   raop_ntp_get_port(raop->legacy_ntp));
     }
 }
 
@@ -1460,9 +1460,9 @@ raop_handler_teardown(raop_conn_t *conn,
             raop_rtp_destroy(conn->raop_rtp);
             conn->raop_rtp = NULL;
         }
-        if (conn->raop_rtp_mirror) {
-            raop_rtp_mirror_destroy(conn->raop_rtp_mirror);
-            conn->raop_rtp_mirror = NULL;
+        if (raop->legacy_rtp_mirror) {
+            raop_rtp_mirror_destroy(raop->legacy_rtp_mirror);
+            raop->legacy_rtp_mirror = NULL;
         }
         return;
     }

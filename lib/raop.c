@@ -59,6 +59,14 @@ struct raop_s {
     httpd_t *httpd;
     legacy_mirror_t *legacy_mirror;
 
+    /* iOS 5/6 video runs on a TCP socket that is independent of the RTSP
+     * connection on port 7000.  The NTP timing session and the H.264 mirror
+     * receiver therefore have to outlive the raop_conn_t that negotiated
+     * them, so they are owned by raop_t instead.  The audio receiver
+     * (conn->raop_rtp) stays bound to the RTSP connection as usual. */
+    raop_ntp_t *legacy_ntp;
+    raop_rtp_mirror_t *legacy_rtp_mirror;
+
     dnssd_t *dnssd;
 
     /* local network ports */  
@@ -135,12 +143,33 @@ struct raop_conn_s {
 typedef struct raop_conn_s raop_conn_t;
 
 static int
-raop_ensure_legacy_ntp(raop_conn_t *conn, unsigned short timing_rport)
+raop_ensure_legacy_ntp_addr(raop_t *raop, const char *remote, int remotelen,
+                            unsigned short timing_rport)
 {
-    if (conn->raop_ntp) {
+    if (raop->legacy_ntp) {
         return 0;
     }
+    timing_protocol_t protocol = NTP_LEGACY;
+    raop->legacy_ntp = raop_ntp_init(raop->logger, &raop->callbacks, remote,
+                                     remotelen,
+                                     timing_rport ? timing_rport : 7010,
+                                     &protocol);
+    if (!raop->legacy_ntp) {
+        return -1;
+    }
+    unsigned short local_port = raop->timing_lport;
+    raop_ntp_start(raop->legacy_ntp, &local_port);
+    raop->timing_lport = local_port;
+    return 0;
+}
+
+static int
+raop_ensure_legacy_ntp(raop_conn_t *conn, unsigned short timing_rport)
+{
     raop_t *raop = conn->raop;
+    if (raop->legacy_ntp) {
+        return 0;
+    }
     char remote[40] = {0};
     int len = utils_ipaddress_to_string(conn->remotelen, conn->remote,
                                         conn->zone_id, remote,
@@ -150,19 +179,8 @@ raop_ensure_legacy_ntp(raop_conn_t *conn, unsigned short timing_rport)
                    "Could not determine iOS 6 client address");
         return -1;
     }
-
-    timing_protocol_t protocol = NTP_LEGACY;
-    conn->raop_ntp = raop_ntp_init(raop->logger, &raop->callbacks, remote,
-                                   conn->remotelen,
-                                   timing_rport ? timing_rport : 7010,
-                                   &protocol);
-    if (!conn->raop_ntp) {
-        return -1;
-    }
-    unsigned short local_port = raop->timing_lport;
-    raop_ntp_start(conn->raop_ntp, &local_port);
-    raop->timing_lport = local_port;
-    return 0;
+    return raop_ensure_legacy_ntp_addr(raop, remote, conn->remotelen,
+                                       timing_rport);
 }
 
 static int
@@ -196,20 +214,13 @@ raop_legacy_stream_start(void *opaque, int stream_fd, const char *body,
         return -1;
     }
 
-    raop_conn_t *conn = httpd_get_connection_by_type(
-        raop->httpd, CONNECTION_TYPE_RAOP, 1);
-    if (!conn) {
-        logger_log(raop->logger, LOGGER_ERR,
-                   "iOS 6 /stream arrived without an active RTSP session");
-        free(param1);
-        free(param2);
-        plist_free(root);
-        return -1;
-    }
-
+    /* The video key is FairPlay-encrypted using the handshake that was
+     * performed on this same TCP 7100 connection (POST /fp-setup), so the
+     * decryption state lives in legacy_mirror->fairplay.  The RTSP session
+     * on port 7000 is a completely independent session and may already be
+     * gone; do not look it up here. */
     unsigned char aeskey[16] = {0};
-    if (fairplay_decrypt(conn->fairplay, (unsigned char *) param1, aeskey) &&
-        legacy_mirror_decrypt_key(raop->legacy_mirror,
+    if (legacy_mirror_decrypt_key(raop->legacy_mirror,
                                   (unsigned char *) param1, aeskey)) {
         logger_log(raop->logger, LOGGER_ERR,
                    "Could not decrypt iOS 6 video key");
@@ -220,37 +231,59 @@ raop_legacy_stream_start(void *opaque, int stream_fd, const char *body,
     }
     free(param1);
 
-    if (raop_ensure_legacy_ntp(conn, 7010)) {
+    /* Derive the client address from the /stream socket itself. */
+    struct sockaddr_storage peer_saddr;
+    socklen_t peer_len = sizeof(peer_saddr);
+    char remote[40] = {0};
+    int remotelen = 0;
+    unsigned int zone_id = 0;
+    if (getpeername(stream_fd, (struct sockaddr *) &peer_saddr, &peer_len) == 0) {
+        const unsigned char *addr = netutils_get_address(
+            &peer_saddr, &remotelen, &zone_id, NULL);
+        if (addr) {
+            utils_ipaddress_to_string(remotelen, addr, zone_id,
+                                      remote, (int) sizeof(remote));
+        }
+    }
+    if (!remote[0]) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "Could not determine iOS 6 client address from stream socket");
         free(param2);
         plist_free(root);
         return -1;
-    }
-    if (conn->raop_rtp_mirror) {
-        raop_rtp_mirror_destroy(conn->raop_rtp_mirror);
-        conn->raop_rtp_mirror = NULL;
     }
 
-    char remote[40] = {0};
-    utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id,
-                              remote, (int) sizeof(remote));
-    conn->raop_rtp_mirror = raop_rtp_mirror_init(
-        raop->logger, &raop->callbacks, conn->raop_ntp, remote,
-        conn->remotelen, aeskey);
-    if (!conn->raop_rtp_mirror) {
+    /* Ensure NTP timing exists.  It may have been created during SETUP
+     * mode=screen; if not (e.g. RTSP already closed), create it now from
+     * the stream peer address. */
+    if (raop_ensure_legacy_ntp_addr(raop, remote, remotelen, 7010)) {
         free(param2);
         plist_free(root);
         return -1;
     }
-    raop_rtp_mirror_init_legacy_aes(conn->raop_rtp_mirror,
+
+    if (raop->legacy_rtp_mirror) {
+        raop_rtp_mirror_destroy(raop->legacy_rtp_mirror);
+        raop->legacy_rtp_mirror = NULL;
+    }
+    raop->legacy_rtp_mirror = raop_rtp_mirror_init(
+        raop->logger, &raop->callbacks, raop->legacy_ntp, remote,
+        remotelen, aeskey);
+    if (!raop->legacy_rtp_mirror) {
+        free(param2);
+        plist_free(root);
+        return -1;
+    }
+    raop_rtp_mirror_init_legacy_aes(raop->legacy_rtp_mirror,
                                     (unsigned char *) param2);
     free(param2);
     plist_free(root);
     raop_destroy_airplay_video(raop, -1);
 
-    if (raop_rtp_mirror_start_fd(conn->raop_rtp_mirror, stream_fd,
+    if (raop_rtp_mirror_start_fd(raop->legacy_rtp_mirror, stream_fd,
                                  raop->clientFPSdata)) {
-        raop_rtp_mirror_destroy(conn->raop_rtp_mirror);
-        conn->raop_rtp_mirror = NULL;
+        raop_rtp_mirror_destroy(raop->legacy_rtp_mirror);
+        raop->legacy_rtp_mirror = NULL;
         return -1;
     }
     return 0;
@@ -752,6 +785,8 @@ raop_init(raop_callbacks_t *callbacks) {
     raop->data_lport = 0;
     raop->mirror_data_lport = 0;
     raop->legacy_mirror = NULL;
+    raop->legacy_ntp = NULL;
+    raop->legacy_rtp_mirror = NULL;
 
     /* initialize configurable plist parameters */
     raop->width = 1920;
@@ -835,6 +870,10 @@ raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile)
 void
 raop_destroy(raop_t *raop) {
     if (raop) {
+        raop_rtp_mirror_destroy(raop->legacy_rtp_mirror);
+        raop->legacy_rtp_mirror = NULL;
+        raop_ntp_destroy(raop->legacy_ntp);
+        raop->legacy_ntp = NULL;
         legacy_mirror_destroy(raop->legacy_mirror);
         raop->legacy_mirror = NULL;
         raop_destroy_airplay_video(raop, -1);
