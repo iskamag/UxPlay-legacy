@@ -2080,6 +2080,49 @@ static int start_dnssd(std::vector<char> hw_addr, std::string name) {
 
     /* bit 27 of Features determines whether the AirPlay2 client-pairing protocol will be used (1) or not (0) */
     dnssd_set_airplay_features(dnssd, 27, (int) setup_legacy_pairing);
+
+    /* iOS 5/6 mode: advertise the feature set that matches the pre-iOS-9
+     * mirroring protocol.  The modern features code advertises capabilities
+     * (FairPlay SAPv2.5, AirPlay 2 multiroom, etc.) that confuse iOS 5/6
+     * clients.  The working reference implementations (PyOpenAirMirror,
+     * Slave-in-the-Magic-Mirror) advertise a much simpler set.
+     * Crucially, bit 12 (FPSAPv2pt5_AES_GCM) must be OFF so the client
+     * uses the original FairPlay SAP that playfair implements, and all
+     * bits 32+ (AirPlay 2 features) must be OFF. */
+    if (ios6_legacy_mode) {
+        dnssd_set_airplay_features(dnssd,  0, 1); // Video
+        dnssd_set_airplay_features(dnssd,  1, 1); // Photo
+        dnssd_set_airplay_features(dnssd,  2, 1); // VideoFairPlay
+        dnssd_set_airplay_features(dnssd,  3, 1); // VideoVolumeControl
+        dnssd_set_airplay_features(dnssd,  4, 1); // VideoHTTPLiveStreams
+        dnssd_set_airplay_features(dnssd,  5, 1); // Slideshow
+        dnssd_set_airplay_features(dnssd,  6, 1); //
+        dnssd_set_airplay_features(dnssd,  7, 1); // Screen mirroring
+        dnssd_set_airplay_features(dnssd,  8, 0); // ScreenRotate
+        dnssd_set_airplay_features(dnssd,  9, 1); // Audio
+        dnssd_set_airplay_features(dnssd, 10, 1); //
+        dnssd_set_airplay_features(dnssd, 11, 1); // AudioRedundant
+        dnssd_set_airplay_features(dnssd, 12, 0); // FPSAPv2pt5_AES_GCM — MUST BE OFF
+        dnssd_set_airplay_features(dnssd, 13, 1); // PhotoCaching
+        dnssd_set_airplay_features(dnssd, 14, 1); // FairPlay auth
+        dnssd_set_airplay_features(dnssd, 15, 1); // Artwork
+        dnssd_set_airplay_features(dnssd, 16, 1); // Progress
+        dnssd_set_airplay_features(dnssd, 17, 1); // Text
+        dnssd_set_airplay_features(dnssd, 18, 1); // AudioFormat1
+        dnssd_set_airplay_features(dnssd, 19, 0); // AudioFormat2
+        dnssd_set_airplay_features(dnssd, 20, 0); // AudioFormat3
+        dnssd_set_airplay_features(dnssd, 21, 0); // AudioFormat4
+        dnssd_set_airplay_features(dnssd, 22, 1); // FairPlay auth type
+        dnssd_set_airplay_features(dnssd, 23, 0); // RSA auth type
+        dnssd_set_airplay_features(dnssd, 24, 0);
+        dnssd_set_airplay_features(dnssd, 25, 1);
+        dnssd_set_airplay_features(dnssd, 26, 0);
+        dnssd_set_airplay_features(dnssd, 27, 0); // No legacy pairing
+        dnssd_set_airplay_features(dnssd, 28, 1);
+        dnssd_set_airplay_features(dnssd, 29, 0);
+        dnssd_set_airplay_features(dnssd, 30, 1); // RAOP
+        dnssd_set_airplay_features(dnssd, 31, 0);
+    }
     return 0;
 }
 
