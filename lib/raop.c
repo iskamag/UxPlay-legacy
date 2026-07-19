@@ -60,12 +60,13 @@ struct raop_s {
     legacy_mirror_t *legacy_mirror;
 
     /* iOS 5/6 video runs on a TCP socket that is independent of the RTSP
-     * connection on port 7000.  The NTP timing session and the H.264 mirror
-     * receiver therefore have to outlive the raop_conn_t that negotiated
-     * them, so they are owned by raop_t instead.  The audio receiver
-     * (conn->raop_rtp) stays bound to the RTSP connection as usual. */
+     * connection on port 7000.  The NTP timing session, the H.264 mirror
+     * receiver, AND the audio RTP receiver all have to outlive the
+     * raop_conn_t that negotiated them, because the client closes the
+     * RTSP connection before connecting to port 7100 for video. */
     raop_ntp_t *legacy_ntp;
     raop_rtp_mirror_t *legacy_rtp_mirror;
+    raop_rtp_t *legacy_rtp;
 
     dnssd_t *dnssd;
 
@@ -234,6 +235,9 @@ raop_legacy_stream_start(void *opaque, int stream_fd, const char *body,
         return -1;
     }
     free(param1);
+
+    logger_log(raop->logger, LOGGER_INFO,
+               "iOS 6 video key decrypted successfully");
 
     /* Derive the client address from the /stream socket itself. */
     struct sockaddr_storage peer_saddr;
@@ -791,6 +795,7 @@ raop_init(raop_callbacks_t *callbacks) {
     raop->legacy_mirror = NULL;
     raop->legacy_ntp = NULL;
     raop->legacy_rtp_mirror = NULL;
+    raop->legacy_rtp = NULL;
 
     /* initialize configurable plist parameters */
     raop->width = 1920;
@@ -876,6 +881,8 @@ raop_destroy(raop_t *raop) {
     if (raop) {
         raop_rtp_mirror_destroy(raop->legacy_rtp_mirror);
         raop->legacy_rtp_mirror = NULL;
+        raop_rtp_destroy(raop->legacy_rtp);
+        raop->legacy_rtp = NULL;
         raop_ntp_destroy(raop->legacy_ntp);
         raop->legacy_ntp = NULL;
         legacy_mirror_destroy(raop->legacy_mirror);

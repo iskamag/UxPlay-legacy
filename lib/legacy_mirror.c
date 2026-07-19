@@ -225,13 +225,13 @@ legacy_handle_post(legacy_mirror_t *legacy, int fd, const char *body,
 {
     legacy_log_plist(legacy, body, body_len);
 
-    /* The spec says no HTTP response is sent for POST /stream, but iOS 8
-     * (AirPlay/160.10) appears to require one to keep the connection open.
-     * Send a minimal 200 OK with no body. */
     static const char response[] =
         "HTTP/1.1 200 OK\r\n"
-        "Content-Length: 0\r\n\r\n";
-    legacy_send_all(fd, response, sizeof(response) - 1);
+        "Content-Length: 0\r\n"
+        "Server: AirTunes/130.14\r\n\r\n";
+    if (legacy_send_all(fd, response, sizeof(response) - 1) < 0) {
+        return -1;
+    }
 
     logger_log(legacy->logger, LOGGER_INFO,
                "Accepted iOS 6 POST /stream; handing off legacy H.264 stream");

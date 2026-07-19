@@ -715,25 +715,31 @@ raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
      * regardless of whether the client asked for /audio or /video,
      * mode=screen or mode=record, or RTP/AVP/TCP.  The video stream
      * itself comes via POST /stream on TCP 7100 and doesn't use these
-     * ports. */
+     * ports.
+     *
+     * The audio receiver is stored on raop->legacy_rtp (not conn->raop_rtp)
+     * so it survives the RTSP connection closing.  The iOS 6 client closes
+     * the RTSP connection before connecting to port 7100 for video, and
+     * expects the audio UDP ports to still be listening when it starts
+     * sending audio alongside the video stream. */
     unsigned short control_lport = raop->control_lport;
     unsigned short data_lport = raop->data_lport;
-    if (!conn->raop_rtp) {
+    if (!raop->legacy_rtp) {
         char remote[40] = {0};
         utils_ipaddress_to_string(conn->remotelen, conn->remote,
                                   conn->zone_id, remote,
                                   (int) sizeof(remote));
-        conn->raop_rtp = raop_rtp_init(
+        raop->legacy_rtp = raop_rtp_init(
             raop->logger, &raop->callbacks, raop->legacy_ntp, remote,
             conn->remotelen, conn->legacy_aeskey, conn->legacy_aesiv);
-        if (!conn->raop_rtp) {
+        if (!raop->legacy_rtp) {
             http_response_init(response, "RTSP/1.0", 500,
                                "Internal Server Error");
             return;
         }
         unsigned char ct = conn->legacy_audio_ct;
         unsigned int sample_rate = conn->legacy_audio_sample_rate;
-        raop_rtp_start_audio(conn->raop_rtp, &remote_cport,
+        raop_rtp_start_audio(raop->legacy_rtp, &remote_cport,
                              &control_lport, &data_lport, &ct,
                              &sample_rate);
         raop->control_lport = control_lport;
