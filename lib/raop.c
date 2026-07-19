@@ -150,10 +150,14 @@ raop_ensure_legacy_ntp_addr(raop_t *raop, const char *remote, int remotelen,
         return 0;
     }
     timing_protocol_t protocol = NTP_LEGACY;
+    /* iOS 5/6 always runs its NTPv4 server on the fixed port 7010.
+     * The "timing_port=" in the SETUP Transport header is the RTP/RTCP
+     * timing port, not the NTP port — sending NTP requests there gets
+     * silence, and without clock sync the client never starts the video
+     * stream. */
+    (void) timing_rport;
     raop->legacy_ntp = raop_ntp_init(raop->logger, &raop->callbacks, remote,
-                                     remotelen,
-                                     timing_rport ? timing_rport : 7010,
-                                     &protocol);
+                                     remotelen, 7010, &protocol);
     if (!raop->legacy_ntp) {
         return -1;
     }
