@@ -1047,7 +1047,11 @@ raop_start_legacy_mirror(raop_t *raop, unsigned short *port)
     if (!raop->legacy_mirror) {
         return -1;
     }
-    return legacy_mirror_start(raop->legacy_mirror, port);
+    int result = legacy_mirror_start(raop->legacy_mirror, port);
+    if (!result) {
+        raop->mirror_data_lport = *port;
+    }
+    return result;
 }
 
 void

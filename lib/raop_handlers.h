@@ -675,6 +675,7 @@ raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
                           http_response_t *response)
 {
     raop_t *raop = conn->raop;
+    const char *url = http_request_get_url(request);
     const char *transport = http_request_get_header(request, "Transport");
     unsigned short remote_cport = 0;
     unsigned short remote_tport = 7010;
@@ -686,6 +687,24 @@ raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
     }
     logger_log(raop->logger, LOGGER_INFO,
                "iOS 6 SETUP Transport: %s", transport);
+
+    /* iOS 6 negotiates the raw mirroring socket independently from audio.
+     * It asks for RTP/AVP/TCP on .../video and expects the receiver's
+     * already-listening mirroring port in server_port.  The old code instead
+     * returned the audio UDP transport; the earlier TCP experiment returned
+     * port zero.  This exact response shape is used by the xindawn receiver. */
+    if (url && strstr(url, "/video")) {
+        char response_transport[128];
+        snprintf(response_transport, sizeof(response_transport),
+                 "RTP/AVP/TCP;unicast;mode=record;server_port=%u",
+                 raop->mirror_data_lport);
+        http_response_add_header(response, "Transport", response_transport);
+        http_response_add_header(response, "Session", "1");
+        logger_log(raop->logger, LOGGER_INFO,
+                   "iOS 6 video SETUP: mirror TCP %u",
+                   raop->mirror_data_lport);
+        return;
+    }
 
     int control_status = raop_legacy_transport_port(
         transport, "control_port=", &remote_cport);
@@ -710,12 +729,9 @@ raop_handler_legacy_setup(raop_conn_t *conn, http_request_t *request,
         return;
     }
 
-    /* Both reference implementations (espes, PyOpenAirMirror) always
-     * respond with RTP/AVP/UDP;mode=record and real audio port numbers,
-     * regardless of whether the client asked for /audio or /video,
-     * mode=screen or mode=record, or RTP/AVP/TCP.  The video stream
-     * itself comes via POST /stream on TCP 7100 and doesn't use these
-     * ports.
+    /* The old receivers respond to audio SETUP with RTP/AVP/UDP,
+     * mode=record, and real audio port numbers.  The video stream itself
+     * comes via POST /stream on the independently negotiated TCP port.
      *
      * The audio receiver is stored on raop->legacy_rtp (not conn->raop_rtp)
      * so it survives the RTSP connection closing.  The iOS 6 client closes
