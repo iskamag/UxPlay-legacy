@@ -310,17 +310,16 @@ raop_rtp_mirror_thread(void *arg)
 
         if (stream_fd != -1 && FD_ISSET(stream_fd, &rfds)) {
 
-            /* Diagnostic: log the first bytes arriving on the /stream socket
-             * after the POST /stream plist has been consumed.  This tells us
-             * whether the client is sending video data, closing, or stalling. */
-            {
+            /* Retain packet inspection for the most verbose debug level only.
+             * Logging every frame at INFO can itself make an old sender lag. */
+            if (logger_debug_data) {
                 unsigned char peek[128];
                 int peeked = recv(stream_fd, CAST peek, sizeof(peek), MSG_PEEK);
                 if (peeked == 0) {
-                    logger_log(raop_rtp_mirror->logger, LOGGER_INFO,
+                    logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG_DATA,
                                "DIAG /stream: client closed connection (EOF)");
                 } else if (peeked < 0) {
-                    logger_log(raop_rtp_mirror->logger, LOGGER_INFO,
+                    logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG_DATA,
                                "DIAG /stream: recv error %d (errno=%d %s)",
                                peeked, errno, strerror(errno));
                 } else {
@@ -331,7 +330,7 @@ raop_rtp_mirror_thread(void *arg)
                         pos += snprintf(hex + pos, sizeof(hex) - pos,
                                         "%02x ", peek[i]);
                     }
-                    logger_log(raop_rtp_mirror->logger, LOGGER_INFO,
+                    logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG_DATA,
                                "DIAG /stream: %d bytes arrived, first %d: %s",
                                peeked, limit, hex);
                 }
