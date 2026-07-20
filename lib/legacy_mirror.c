@@ -35,6 +35,7 @@
 
 #define LEGACY_HEADER_LIMIT (64 * 1024)
 #define LEGACY_BODY_LIMIT   (1024 * 1024)
+#define LEGACY_MAX_CLIENTS  8
 
 struct legacy_mirror_s {
     logger_t *logger;
@@ -281,10 +282,59 @@ legacy_handle_fairplay(legacy_mirror_t *legacy, int fd, const char *body,
                body_len);
 }
 
+static bool
+legacy_handle_client(legacy_mirror_t *legacy, int client_fd)
+{
+    bool stream_handed_off = false;
+    while (!stream_handed_off) {
+        MUTEX_LOCK(legacy->mutex);
+        int running = legacy->running;
+        MUTEX_UNLOCK(legacy->mutex);
+        if (!running) {
+            break;
+        }
+
+        char *request = NULL;
+        size_t body_offset = 0;
+        size_t body_len = 0;
+        if (legacy_read_request(client_fd, &request, &body_offset,
+                                &body_len)) {
+            break;
+        }
+        char method[16] = {0};
+        char path[256] = {0};
+        sscanf(request, "%15s %255s", method, path);
+        logger_log(legacy->logger, LOGGER_INFO,
+                   "iOS 6 mirror request: %s %s", method, path);
+        if (!strcmp(method, "GET") && !strcmp(path, "/stream.xml")) {
+            legacy_handle_get(legacy, client_fd);
+        } else if (!strcmp(method, "POST") &&
+                   !strcmp(path, "/fp-setup")) {
+            legacy_handle_fairplay(legacy, client_fd,
+                                   request + body_offset, body_len);
+        } else if (!strcmp(method, "POST") && !strcmp(path, "/stream")) {
+            stream_handed_off =
+                !legacy_handle_post(legacy, client_fd,
+                                    request + body_offset, body_len);
+        } else {
+            static const char not_found[] =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            legacy_send_all(client_fd, not_found, sizeof(not_found) - 1);
+        }
+        free(request);
+    }
+
+    return stream_handed_off;
+}
+
 static THREAD_RETVAL
 legacy_mirror_thread(void *opaque)
 {
     legacy_mirror_t *legacy = opaque;
+    int clients[LEGACY_MAX_CLIENTS];
+    for (int i = 0; i < LEGACY_MAX_CLIENTS; i++) {
+        clients[i] = -1;
+    }
 
     while (1) {
         MUTEX_LOCK(legacy->mutex);
@@ -298,8 +348,17 @@ legacy_mirror_thread(void *opaque)
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(server_fd, &read_fds);
+        int nfds = server_fd + 1;
+        for (int i = 0; i < LEGACY_MAX_CLIENTS; i++) {
+            if (clients[i] >= 0) {
+                FD_SET(clients[i], &read_fds);
+                if (clients[i] >= nfds) {
+                    nfds = clients[i] + 1;
+                }
+            }
+        }
         struct timeval timeout = {1, 0};
-        int ready = select(server_fd + 1, &read_fds, NULL, NULL, &timeout);
+        int ready = select(nfds, &read_fds, NULL, NULL, &timeout);
         if (ready == 0) {
             continue;
         }
@@ -310,64 +369,68 @@ legacy_mirror_thread(void *opaque)
             break;
         }
 
-        int client_fd = accept(server_fd, NULL, NULL);
-        if (client_fd < 0) {
-            if (errno == EINTR) {
+        if (FD_ISSET(server_fd, &read_fds)) {
+            int client_fd = accept(server_fd, NULL, NULL);
+            if (client_fd < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            int slot = -1;
+            for (int i = 0; i < LEGACY_MAX_CLIENTS; i++) {
+                if (clients[i] < 0) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot < 0) {
+                logger_log(legacy->logger, LOGGER_WARNING,
+                           "Too many pending iOS 6 mirror connections");
+                shutdown(client_fd, SHUT_RDWR);
+                CLOSESOCKET(client_fd);
+            } else {
+                clients[slot] = client_fd;
+                logger_log(legacy->logger, LOGGER_INFO,
+                           "Accepted iOS 6 mirror connection on TCP 7100 "
+                           "(socket %d)", client_fd);
+            }
+        }
+
+        /* A SETUP response naming TCP 7100 makes iOS 6 open an idle data
+         * connection before it opens the HTTP /stream control connection.
+         * Keep every accepted socket pending until it actually has input so
+         * the idle socket cannot monopolize this listener. */
+        for (int i = 0; i < LEGACY_MAX_CLIENTS; i++) {
+            int client_fd = clients[i];
+            if (client_fd < 0 || !FD_ISSET(client_fd, &read_fds)) {
                 continue;
+            }
+            clients[i] = -1;
+            MUTEX_LOCK(legacy->mutex);
+            legacy->client_fd = client_fd;
+            MUTEX_UNLOCK(legacy->mutex);
+
+            bool stream_handed_off =
+                legacy_handle_client(legacy, client_fd);
+
+            MUTEX_LOCK(legacy->mutex);
+            if (legacy->client_fd == client_fd) {
+                legacy->client_fd = -1;
+            }
+            MUTEX_UNLOCK(legacy->mutex);
+            if (!stream_handed_off) {
+                shutdown(client_fd, SHUT_RDWR);
+                CLOSESOCKET(client_fd);
             }
             break;
         }
-        MUTEX_LOCK(legacy->mutex);
-        legacy->client_fd = client_fd;
-        MUTEX_UNLOCK(legacy->mutex);
+    }
 
-        bool stream_handed_off = false;
-        while (!stream_handed_off) {
-            MUTEX_LOCK(legacy->mutex);
-            running = legacy->running;
-            MUTEX_UNLOCK(legacy->mutex);
-            if (!running) {
-                break;
-            }
-
-            char *request = NULL;
-            size_t body_offset = 0;
-            size_t body_len = 0;
-            if (legacy_read_request(client_fd, &request, &body_offset,
-                                    &body_len)) {
-                break;
-            }
-            char method[16] = {0};
-            char path[256] = {0};
-            sscanf(request, "%15s %255s", method, path);
-            logger_log(legacy->logger, LOGGER_INFO,
-                       "iOS 6 mirror request: %s %s", method, path);
-            if (!strcmp(method, "GET") && !strcmp(path, "/stream.xml")) {
-                legacy_handle_get(legacy, client_fd);
-            } else if (!strcmp(method, "POST") &&
-                       !strcmp(path, "/fp-setup")) {
-                legacy_handle_fairplay(legacy, client_fd,
-                                       request + body_offset, body_len);
-            } else if (!strcmp(method, "POST") && !strcmp(path, "/stream")) {
-                stream_handed_off =
-                    !legacy_handle_post(legacy, client_fd,
-                                        request + body_offset, body_len);
-            } else {
-                static const char not_found[] =
-                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-                legacy_send_all(client_fd, not_found, sizeof(not_found) - 1);
-            }
-            free(request);
-        }
-
-        MUTEX_LOCK(legacy->mutex);
-        if (legacy->client_fd == client_fd) {
-            legacy->client_fd = -1;
-        }
-        MUTEX_UNLOCK(legacy->mutex);
-        if (!stream_handed_off) {
-            shutdown(client_fd, SHUT_RDWR);
-            CLOSESOCKET(client_fd);
+    for (int i = 0; i < LEGACY_MAX_CLIENTS; i++) {
+        if (clients[i] >= 0) {
+            shutdown(clients[i], SHUT_RDWR);
+            CLOSESOCKET(clients[i]);
         }
     }
 
@@ -419,7 +482,7 @@ legacy_mirror_start(legacy_mirror_t *legacy, unsigned short *port)
     }
 
     int fd = netutils_init_socket(port, 0, 0);
-    if (fd < 0 || listen(fd, 2) < 0) {
+    if (fd < 0 || listen(fd, LEGACY_MAX_CLIENTS) < 0) {
         if (fd >= 0) {
             CLOSESOCKET(fd);
         }
