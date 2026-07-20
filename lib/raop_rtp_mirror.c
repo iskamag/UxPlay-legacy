@@ -309,6 +309,33 @@ raop_rtp_mirror_thread(void *arg)
 
         if (stream_fd != -1 && FD_ISSET(stream_fd, &rfds)) {
 
+            /* Diagnostic: log the first bytes arriving on the /stream socket
+             * after the POST /stream plist has been consumed.  This tells us
+             * whether the client is sending video data, closing, or stalling. */
+            {
+                unsigned char peek[128];
+                int peeked = recv(stream_fd, CAST peek, sizeof(peek), MSG_PEEK);
+                if (peeked == 0) {
+                    logger_log(raop_rtp_mirror->logger, LOGGER_INFO,
+                               "DIAG /stream: client closed connection (EOF)");
+                } else if (peeked < 0) {
+                    logger_log(raop_rtp_mirror->logger, LOGGER_INFO,
+                               "DIAG /stream: recv error %d (errno=%d %s)",
+                               peeked, errno, strerror(errno));
+                } else {
+                    char hex[384];
+                    int pos = 0;
+                    int limit = peeked > 48 ? 48 : peeked;
+                    for (int i = 0; i < limit; i++) {
+                        pos += snprintf(hex + pos, sizeof(hex) - pos,
+                                        "%02x ", peek[i]);
+                    }
+                    logger_log(raop_rtp_mirror->logger, LOGGER_INFO,
+                               "DIAG /stream: %d bytes arrived, first %d: %s",
+                               peeked, limit, hex);
+                }
+            }
+
             // The first 128 bytes are some kind of header for the payload that follows
             while (payload == NULL && readstart < 128) {
                 unsigned char* pos  = packet + readstart;
