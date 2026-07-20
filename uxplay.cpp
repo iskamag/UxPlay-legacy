@@ -531,6 +531,15 @@ static void dump_video_to_file(unsigned char *data, int datalen) {
 }
 
 static gboolean feedback_callback(gpointer loop) {
+    /* POST /feedback belongs to the newer AirPlay protocol.  iOS 5/6 keeps
+     * its legacy RAOP session alive with RTSP OPTIONS and NTP replies instead.
+     * Applying the modern feedback timeout here tears down a healthy legacy
+     * session before the client finishes preparing POST /stream. */
+    if (ios6_legacy_mode) {
+        missed_feedback = 0;
+        return TRUE;
+    }
+
     if (open_connections) {
         if (missed_feedback_limit && missed_feedback > missed_feedback_limit) {
             LOGI("***ERROR lost connection with client (network problem?)");
