@@ -193,6 +193,7 @@ raop_rtp_mirror_thread(void *arg)
     assert(raop_rtp_mirror);
 
     int stream_fd = raop_rtp_mirror->legacy_stream_fd;
+    bool legacy_stream = stream_fd >= 0;
     unsigned char packet[128] = {0};
     unsigned char* sps_pps = NULL;
     bool prepend_sps_pps = false;
@@ -464,7 +465,14 @@ raop_rtp_mirror_thread(void *arg)
                  * that has not yet been sent.   This will trigger prepending it to the current NAL, and the prepend_sps_pps 
                  * flag will be set to false after it has been prepended.  */
 
-                if (prepend_sps_pps & (ntp_timestamp_raw != ntp_timestamp_nal)) {
+                /* The original mirroring protocol sends avcC codec data
+                 * before the video bitstream, but its codec and video packet
+                 * timestamps are independent (the examples in the 5.x
+                 * protocol specification differ as well).  Newer senders
+                 * pair codec data with a video packet using an identical
+                 * timestamp, which remains a useful stale-codec guard there. */
+                if (prepend_sps_pps && !legacy_stream &&
+                    ntp_timestamp_raw != ntp_timestamp_nal) {
                         logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG,
                                    "raop_rtp_mirror: prepended sps_pps timestamp does not match timestamp of "
                                    "video payload\n%llu\n%llu , discarding", ntp_timestamp_raw, ntp_timestamp_nal);
